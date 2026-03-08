@@ -233,6 +233,7 @@ class NasaDataSaver:
         except Exception as e:
             logger.error(f"Error updating metadata: {str(e)}")
             return {"status": "error", "error": str(e)}
+        
 class NasaPreprocessor:
     """Main class for preprocessing NASA POWER datasets"""
     
@@ -244,6 +245,7 @@ class NasaPreprocessor:
         self.original_data = None
         self.saver = NasaDataSaver()
         self.preprocessing_report = {
+            "dataset_type": "nasa",
             "missing_data": {},
             "outliers": {},
             "smoothing": {},
@@ -251,8 +253,10 @@ class NasaPreprocessor:
             "gaps": {},
             "model_coverage": {},
             "quality_metrics": {},
-            "warnings": []
+            "warnings": [],
+            "decomposition": {}  # Decomposition unified report
         }
+        
         
     def _sanitize_for_mongodb(self, obj):
         """
@@ -270,12 +274,21 @@ class NasaPreprocessor:
             return bool(obj)
         elif isinstance(obj, np.ndarray):
             return obj.tolist()
+        elif isinstance(obj, pd.DataFrame):
+            # Convert DataFrame to list of dictionaries
+            return obj.to_dict('records')
+        elif isinstance(obj, pd.Series):
+            return obj.tolist()
+        elif isinstance(obj, pd.Index):
+            return obj.tolist()
+        elif hasattr(obj, 'item'):  # Handle numpy scalars
+            return obj.item()
         else:
             return obj
-        
+                
     def preprocess(self, options: Dict[str, Any] = None) -> Dict[str, Any]:
         """
-        Preprocess NASA POWER dataset
+        Preprocess NASA POWER dataset with unified report storage
         
         Args:
             options: Dictionary of preprocessing options
@@ -288,42 +301,63 @@ class NasaPreprocessor:
             default_options = {
                 "smoothing_method": "exponential",
                 "window_size": 5,
-                "exponential_alpha": 0.15,  # Global default, will be optimized per-parameter
-                "adaptive_alpha_selection": True,
-                "alpha_optimization_range": [0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20],
+                "exponential_alpha": 0.05,
+                "adaptive_alpha_selection": False,
+                "alpha_optimization_range": [0.15, 0.20, 0.25, 0.30, 0.35, 0.40],
+                "trend_window_size": 7,
                 "drop_outliers": True,
                 "outlier_methods": ["iqr", "zscore"],
                 "iqr_multiplier": 2.0,
                 "zscore_threshold": 3.5,
-                "outlier_treatment": "cap",  # or "cap" or "remove"
+                "outlier_treatment": "interpolate",
                 "fill_missing": True,
                 "detect_gaps": True,
-                "exclude_tail_data": True,  # Exclude last 5 days (NASA lag)
-                "max_gap_interpolate": 90,  # days
+                "exclude_tail_data": True,
+                "max_gap_interpolate": 90,
                 "calculate_coverage": True,
                 "columns_to_process": [
                     'T2M', 'T2M_MAX', 'T2M_MIN', 'RH2M', 
                     'PRECTOTCORR', 'ALLSKY_SFC_SW_DWN', 
                     'WS10M', 'WS10M_MAX', 'WD10M'
                 ],
-                "parameter_configs": {
+               "parameter_configs": {
+                    "T2M": {
+                        "smoothing_method": "exponential",
+                        "exponential_alpha": 0.30,  #KEEP (already good: Trend=77.6%, Quality=FAIR)
+                        "reason": "Temperature stable - smoothing ringan preserves daily patterns"
+                    },
+                    
+                    "RH2M": {
+                        "smoothing_method": "exponential",
+                        "exponential_alpha": 0.35,  #CHANGED: 0.25 → 0.35 (+40%)
+                        "reason": "Humidity high variability - lighter smoothing to preserve trend (IMPROVED from 0.25)"
+                    },
+                    
+                    "ALLSKY_SFC_SW_DWN": {
+                        "smoothing_method": "exponential",
+                        "exponential_alpha": 0.30,  #KEEP (working well: Trend=76.4%, GCV=6.95, Quality=FAIR)
+                        "reason": "Solar radiation - balanced smoothing preserves seasonal patterns (VERIFIED)"
+                    },
+                    
                     "PRECTOTCORR": {
-                        "smoothing_method": None,
-                        "apply_outlier_detection": False,
-                        "preserve_zeros": True,
-                        "validate_range": True,
-                        "valid_min": 0.0,
-                        "valid_max": 500.0
+                        "smoothing_method": None,  #NO CHANGE
+                        "reason": "Precipitation events are signal"
                     },
-                    "WD10M": {
-                        "smoothing_method": None,
-                        "apply_outlier_detection": True,  # Can still detect outliers
-                        "reason": "Circular variable - exponential smoothing breaks on 0°-360° wraparound"
+                    
+                    "T2M_MAX": {
+                        "smoothing_method": "exponential",
+                        "exponential_alpha": 0.30  #CHANGED: 0.25 → 0.30 (+20%)
                     },
-                    "WS10M_MAX": {
-                        "smoothing_method": None,  
-                        "reason": "No clear seasonality (0.284) - smoothing adds no value"
-                    }
+                    
+                    "T2M_MIN": {
+                        "smoothing_method": "exponential",
+                        "exponential_alpha": 0.30  #CHANGED: 0.25 → 0.30 (+20%)
+                    },
+                    
+                    # Wind variables - no smoothing
+                    "WS10M": {"smoothing_method": None},
+                    "WS10M_MAX": {"smoothing_method": None},
+                    "WD10M": {"smoothing_method": None}
                 }
             }
             
@@ -331,7 +365,6 @@ class NasaPreprocessor:
             if options is None:
                 options = {}
             self.options = {**default_options, **options}
-        
             
             # Validate dataset
             validation_result = self.validator.validate_dataset(self.db, self.collection_name)
@@ -342,7 +375,7 @@ class NasaPreprocessor:
             df = self.loader.load_data(self.db, self.collection_name)
             logger.info(f"Loaded {len(df)} records from collection '{self.collection_name}'")
             
-            # Apply preprocessing - WILL BE IMPLEMENTED IN FUTURE
+            # Apply preprocessing 
             processed_df = self._apply_preprocessing(df)
             
             # Save processed data
@@ -354,15 +387,12 @@ class NasaPreprocessor:
             
             cleaned_collection = save_result.get("preprocessedCollections", [])[0] if save_result.get("preprocessedCollections") else None
             
-            decomposition_save_result = {}
-            if hasattr(self, 'decomposition_results') and self.decomposition_results:
-                decomposition_save_result = self._save_decomposition_to_mongodb(
-                    self.decomposition_results,
-                    cleaned_collection
-                )
+            # Save unified decompostion report, including decomposition
+            report_save_result = self._save_preprocessing_report(
+                cleaned_collection or self.collection_name
+            )
             
             sanitized_report = self._sanitize_for_mongodb(self.preprocessing_report)
-
             
             return {
                 "status": "success",
@@ -373,19 +403,22 @@ class NasaPreprocessor:
                 "originalRecordCount": len(df),
                 "preprocessedCollections": save_result.get("preprocessedCollections", []),
                 "cleanedCollection": cleaned_collection,
-                "decompositionCollection": decomposition_save_result.get("collection_name"),
-                "decompositionStatus": decomposition_save_result.get("status"),  
-                "parametersDecomposed": decomposition_save_result.get("parameters_decomposed", []),
-                "preprocessing_report": sanitized_report
+                "preprocessing_report": sanitized_report,
+                "report_saved": report_save_result.get("status") == "success",
+                "report_id": report_save_result.get("report_id")
             }
+            
         except Exception as e:
             error_msg = f"Error preprocessing NASA POWER data: {str(e)}"
             logger.error(error_msg)
             raise NasaPreprocessingError(error_msg)
     
-    def _apply_preprocessing(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _apply_preprocessing(
+        self,
+        df: pd.DataFrame
+    )-> pd.DataFrame:
         """Apply preprocessing steps to the data with progress tracking"""
-        logger.info("Starting NASA POWER data preprocessing...")
+        logger.info("Starting NASA POWER DATA preprocessing...")
         
         processed_df = df.copy()
         total_steps = 10
@@ -398,67 +431,110 @@ class NasaPreprocessor:
             nonlocal current_step
             current_step += 1
             percentage = int((current_step / total_steps) * 100)
-            # Format khusus yang akan di-parse oleh SSE handler
             logger.info(f"PROGRESS:{percentage}:{stage}:{message}")
         
-        # STEP 1: Replace NASA POWER fill values
+        # STEP 1-5: Existing preprocessing steps...
         log_progress("fill_values", "Replacing fill values with NaN...")
         processed_df = self._replace_fill_values(processed_df)
         
-        # STEP 2: Exclude tail data
         log_progress("tail_data", "Checking for tail data to exclude...")
         if self.options.get("exclude_tail_data", True):
             processed_df = self._exclude_tail_data(processed_df)
         
-        # STEP 3: Detect and report gaps
         log_progress("gap_detection", "Detecting gaps in time series...")
         if self.options.get("detect_gaps", True):
             self._detect_gaps(processed_df)
         
-        # STEP 4: Handle missing values
         log_progress("imputation", "Imputing missing values...")
         if self.options.get("fill_missing", True):
             processed_df = self._impute_missing_values(processed_df)
         
-        # STEP 5: Detect and handle outliers
         log_progress("outliers", "Detecting and handling outliers...")
         if self.options.get("drop_outliers", True):
             processed_df = self._handle_outliers(processed_df)
-            
-        if self.options.get("adaptive_alpha_selection", False):
-            log_progress("alpha_optimization", "Optimizing smoothing parameters per parameter...")
-            self._optimize_parameter_alphas(processed_df)
-
         
-        # STEP 6: Apply smoothing
+        # Adaptive alpha optimization before smoothing
+        if self.options.get("adaptive_alpha_selection", False):
+            log_progress("alpha_optimization", "Optimizing alpha parameters for better trend preservation...")
+            self._optimize_parameter_alphas(processed_df)
+        
+        # Save data state BEFORE smoothing
+        logger.info("SAVING PRE-SMOOTHING DATA STATE for correct trend validation...")
+        self.pre_smoothing_data = processed_df.copy()
+        
+        # Log verification
+        for param in ['T2M', 'RH2M', 'ALLSKY_SFC_SW_DWN']:
+            if param in self.pre_smoothing_data.columns:
+                stats = self.pre_smoothing_data[param].describe()
+                logger.info(f"PRE-SMOOTHING {param}: mean={stats['mean']:.3f}, std={stats['std']:.3f}, count={stats['count']}")
+        
         log_progress("smoothing", "Applying smoothing methods...")
         processed_df = self._apply_smoothing(processed_df)
         
-        # STEP 7: Validate smoothing quality
+        # Log verification after smoothing
+        for param in ['T2M', 'RH2M', 'ALLSKY_SFC_SW_DWN']:
+            if param in processed_df.columns:
+                stats = processed_df[param].describe()
+                logger.info(f"POST-SMOOTHING {param}: mean={stats['mean']:.3f}, std={stats['std']:.3f}")
+        
+        logger.info("Validating forecasting variable smoothing configuration...")
+        forecasting_vars = ["T2M", "RH2M", "ALLSKY_SFC_SW_DWN", "PRECTOTCORR"]
+        smoothing_summary = self.preprocessing_report.get("smoothing", {}).get("parameters_smoothed", {})
+
+        for var in forecasting_vars:
+            if var in smoothing_summary:
+                status = smoothing_summary[var]
+                if var == "PRECTOTCORR":
+                    if status == "none":
+                        logger.info(f"{var}: Correctly SKIPPED (preserving rain events)")
+                    else:
+                        logger.warning(f"{var}: UNEXPECTED smoothing applied: {status}")
+                else:
+                    if "exponential" in status:
+                        logger.info(f"{var}: {status}")
+                    else:
+                        logger.warning(f"{var}: Unexpected method: {status}")
+        
         log_progress("smoothing_validation", "Validating smoothing quality (GCV + Trend Preservation)...")
         self._validate_smoothing_method(processed_df)
         
-        # STEP 8: Calculate seasonal decomposition (NEW)
-        log_progress("decomposition", "Calculating seasonal decomposition...")
-        decomposition_results = self._calculate_seasonal_decomposition(processed_df)
-        
-        # Store decomposition results for later saving
-        self.decomposition_results = decomposition_results
+        logger.info("Validating forecasting variable smoothing configuration...")
+        forecasting_vars = ["T2M", "RH2M", "ALLSKY_SFC_SW_DWN", "PRECTOTCORR"]
+        smoothing_summary = self.preprocessing_report.get("smoothing", {}).get("parameters_smoothed", {})
 
-        # STEP 9: Calculate model coverage
+        for var in forecasting_vars:
+            if var in smoothing_summary:
+                status = smoothing_summary[var]
+                if var == "PRECTOTCORR":
+                    if status == "none":
+                        logger.info(f"{var}: Correctly SKIPPED (preserving rain events)")
+                    else:
+                        logger.warning(f"{var}: UNEXPECTED smoothing applied: {status}")
+                else:
+                    if "exponential" in status:
+                        logger.info(f"{var}: {status}")
+                    else:
+                        logger.warning(f"{var}: Unexpected method: {status}")
+        
+        log_progress("smoothing_validation", "Validating smoothing quality (GCV + Trend Preservation)...")
+        self._validate_smoothing_method(processed_df)
+        
+        # STEP 8: Calculate and EMBED seasonal decomposition
+        log_progress("decomposition", "Calculating seasonal decomposition...")
+        self._calculate_and_embed_decomposition(processed_df)
+        
+        # STEP 9-10: Coverage and quality metrics
         log_progress("model_coverage", "Calculating model coverage analysis...")
         if self.options.get("calculate_coverage", True):
             self._calculate_model_coverage(processed_df)
             
         self.log_detailed_coverage_analysis(processed_df)
         
-        # STEP 10: Generate quality metrics
         log_progress("quality_metrics", "Generating quality metrics...")
         self._generate_quality_metrics(df, processed_df) 
         
         logger.info(f"Preprocessing completed - processed {len(processed_df)} records")
         return processed_df
-    
     
     def _replace_fill_values(self, df: pd.DataFrame) -> pd.DataFrame:
         """Replace NASA POWER fill values (-999, -99, -9999) with NaN"""
@@ -904,7 +980,7 @@ class NasaPreprocessor:
             "quality": quality_status,
             "gcv": param_validation.get("gcv_score"),
             "trend": param_validation.get("trend_preservation_pct"),
-            "trend_value": trend_value,  # ✅ NEW
+            "trend_value": trend_value,
             "penalty": quality_penalty_map.get(quality_status, 0.0)
         }
         
@@ -973,7 +1049,7 @@ class NasaPreprocessor:
                 param  
             )
         else:
-            # ✅ NEW: Calculate coverage for non-smoothed parameters
+            # Calculate coverage for non-smoothed parameters
             non_smoothed_coverage = self._calculate_non_smoothed_coverage(
                 large_gaps_impact,
                 extreme_outliers_impact,
@@ -1121,9 +1197,9 @@ class NasaPreprocessor:
         Log detailed coverage analysis for debugging and verification.
         Outputs comprehensive breakdown of penalties, thresholds, and quality metrics.
         """
-        logger.info("="*80)
+        
         logger.info("DETAILED COVERAGE ANALYSIS REPORT")
-        logger.info("="*80)
+        
         
         # Get coverage data
         coverage_data = self.preprocessing_report.get("model_coverage", {})
@@ -1141,31 +1217,25 @@ class NasaPreprocessor:
         logger.info(f"  LSTM Suitability: {coverage_data.get('lstm', {}).get('model_suitability', 'unknown').upper()}")
         
         # Per-Parameter Detailed Breakdown
-        logger.info("\n" + "="*80)
+        
         logger.info("PER-PARAMETER DETAILED ANALYSIS:")
-        logger.info("="*80)
+        
         
         params = self.options.get("columns_to_process", [])
         
         for param in params:
             if param not in per_param:
-                logger.info(f"\n❌ {param}: No coverage data available")
+                logger.info(f"\n{param}: No coverage data available")
                 continue
             
             param_data = per_param[param]
-            
-            # Header
-            logger.info(f"\n{'='*80}")
-            logger.info(f"🔍 PARAMETER: {param}")
-            logger.info(f"{'='*80}")
-            
+
             # Basic Coverage
             hw_coverage = param_data.get("holt_winters_coverage", 0)
             lstm_coverage = param_data.get("lstm_coverage", 0)
-            logger.info(f"  📈 Coverage:")
-            logger.info(f"     • Holt-Winters: {hw_coverage:.2f}%")
-            logger.info(f"     • LSTM: {lstm_coverage:.2f}%")
-            
+            logger.info(f"Coverage:")
+            logger.info(f"Holt-Winters: {hw_coverage:.2f}%")
+            logger.info(f"LSTM: {lstm_coverage:.2f}%")
             # Analysis Details
             analysis = param_data.get("analysis_details", {})
             
@@ -1173,77 +1243,77 @@ class NasaPreprocessor:
             smoothing_validation = self.preprocessing_report.get("smoothing_validation", {})
             if param in smoothing_validation:
                 smooth_data = smoothing_validation[param]
-                logger.info(f"\n  🎯 SMOOTHING QUALITY:")
-                logger.info(f"     • Status: {smooth_data.get('quality_status', 'unknown').upper()}")
-                logger.info(f"     • GCV Score: {smooth_data.get('gcv_score', 'N/A')}")
-                logger.info(f"     • Trend Preservation: {smooth_data.get('trend_preservation_pct', 'N/A')}%")
-                logger.info(f"     • Method: {smooth_data.get('smoothing_method', 'none')}")
-                logger.info(f"     • Data Points: {smooth_data.get('data_points', 0)}")
+                logger.info(f"\nSMOOTHING QUALITY:")
+                logger.info(f"Status: {smooth_data.get('quality_status', 'unknown').upper()}")
+                logger.info(f"GCV Score: {smooth_data.get('gcv_score', 'N/A')}")
+                logger.info(f"Trend Preservation: {smooth_data.get('trend_preservation_pct', 'N/A')}%")
+                logger.info(f"Method: {smooth_data.get('smoothing_method', 'none')}")
+                logger.info(f"Data Points: {smooth_data.get('data_points', 0)}")
             
             # 2. Large Gaps Analysis
             large_gaps = analysis.get("large_gaps", {})
             if large_gaps:
-                logger.info(f"\n  📏 LARGE GAPS ANALYSIS:")
-                logger.info(f"     • Impact: {large_gaps.get('impact_percentage', 0):.2f}%")
-                logger.info(f"     • Count: {large_gaps.get('large_gaps_count', 0)}")
-                logger.info(f"     • Total Gap Days: {large_gaps.get('total_gap_days', 0)}")
+                logger.info(f"\nLARGE GAPS ANALYSIS:")
+                logger.info(f"Impact: {large_gaps.get('impact_percentage', 0):.2f}%")
+                logger.info(f"Count: {large_gaps.get('large_gaps_count', 0)}")
+                logger.info(f"Total Gap Days: {large_gaps.get('total_gap_days', 0)}")
             else:
-                logger.info(f"\n  ✅ LARGE GAPS: None detected")
+                logger.info(f"\nLARGE GAPS: None detected")
             
             # 3. Extreme Outliers Analysis
             outliers = analysis.get("extreme_outliers", {})
             if outliers:
-                logger.info(f"\n  ⚠️  EXTREME OUTLIERS:")
-                logger.info(f"     • Impact: {outliers.get('impact_percentage', 0):.2f}%")
-                logger.info(f"     • Count: {outliers.get('extreme_outliers_count', 0)}")
-                logger.info(f"     • Max Z-Score: {outliers.get('max_z_score', 'N/A')}")
+                logger.info(f"\nEXTREME OUTLIERS:")
+                logger.info(f"Impact: {outliers.get('impact_percentage', 0):.2f}%")
+                logger.info(f"Count: {outliers.get('extreme_outliers_count', 0)}")
+                logger.info(f"Max Z-Score: {outliers.get('max_z_score', 'N/A')}")
             else:
-                logger.info(f"\n  ✅ EXTREME OUTLIERS: None detected")
+                logger.info(f"\nEXTREME OUTLIERS: None detected")
             
             # 4. Seasonality Analysis
             seasonality = analysis.get("seasonality", {})
             if seasonality and not seasonality.get("insufficient_data", False):
-                logger.info(f"\n  🌊 SEASONALITY ANALYSIS:")
-                logger.info(f"     • Seasonal Strength: {seasonality.get('seasonal_strength', 0):.3f}")
-                logger.info(f"     • Has Clear Seasonality: {'YES' if seasonality.get('has_clear_seasonality', False) else 'NO'}")
-                logger.info(f"     • Seasonal Variance: {seasonality.get('seasonal_variance', 'N/A')}")
-                logger.info(f"     • Residual Variance: {seasonality.get('residual_variance', 'N/A')}")
+                logger.info(f"\nSEASONALITY ANALYSIS:")
+                logger.info(f"Seasonal Strength: {seasonality.get('seasonal_strength', 0):.3f}")
+                logger.info(f"Has Clear Seasonality: {'YES' if seasonality.get('has_clear_seasonality', False) else 'NO'}")
+                logger.info(f"Seasonal Variance: {seasonality.get('seasonal_variance', 'N/A')}")
+                logger.info(f"Residual Variance: {seasonality.get('residual_variance', 'N/A')}")
                 if seasonality.get("error"):
-                    logger.info(f"     • Error: {seasonality.get('error')}")
+                    logger.info(f"Error: {seasonality.get('error')}")
             else:
-                logger.info(f"\n  ⚠️  SEASONALITY: Insufficient data or not analyzed")
+                logger.info(f"\nSEASONALITY: Insufficient data or not analyzed")
             
             # 5. Stationarity Analysis
             stationarity = analysis.get("stationarity", {})
             if stationarity and not stationarity.get("insufficient_data", False):
-                logger.info(f"\n  📊 STATIONARITY ANALYSIS:")
-                logger.info(f"     • Is Stationary: {'YES' if stationarity.get('is_stationary', False) else 'NO'}")
-                logger.info(f"     • ADF Statistic: {stationarity.get('adf_statistic', 'N/A')}")
-                logger.info(f"     • P-Value: {stationarity.get('p_value', 'N/A')}")
+                logger.info(f"\nSTATIONARITY ANALYSIS:")
+                logger.info(f"Is Stationary: {'YES' if stationarity.get('is_stationary', False) else 'NO'}")
+                logger.info(f"ADF Statistic: {stationarity.get('adf_statistic', 'N/A')}")
+                logger.info(f"P-Value: {stationarity.get('p_value', 'N/A')}")
                 if stationarity.get("critical_values"):
-                    logger.info(f"     • Critical Values:")
+                    logger.info(f"Critical Values:")
                     for level, value in stationarity.get("critical_values", {}).items():
-                        logger.info(f"        - {level}: {value}")
+                        logger.info(f"{level}: {value}")
                 if stationarity.get("error"):
-                    logger.info(f"     • Error: {stationarity.get('error')}")
+                    logger.info(f"Error: {stationarity.get('error')}")
             else:
-                logger.info(f"\n  ⚠️  STATIONARITY: Insufficient data or not analyzed")
+                logger.info(f"\nSTATIONARITY: Insufficient data or not analyzed")
             
             # 6. Precipitation Extremes (if applicable)
             precipitation = analysis.get("precipitation", {})
             if precipitation:
-                logger.info(f"\n  🌧️  PRECIPITATION EXTREMES:")
-                logger.info(f"     • Zero Precipitation Ratio: {precipitation.get('zero_precipitation_ratio', 0):.3f}")
-                logger.info(f"     • Extreme Precipitation Ratio: {precipitation.get('extreme_precipitation_ratio', 0):.3f}")
-                logger.info(f"     • Range Impact: {precipitation.get('range_impact', 0):.3f}")
-                logger.info(f"     • Max Precipitation: {precipitation.get('max_precipitation', 'N/A')} mm")
+                logger.info(f"\nPRECIPITATION EXTREMES:")
+                logger.info(f"Zero Precipitation Ratio: {precipitation.get('zero_precipitation_ratio', 0):.3f}")
+                logger.info(f"Extreme Precipitation Ratio: {precipitation.get('extreme_precipitation_ratio', 0):.3f}")
+                logger.info(f"Range Impact: {precipitation.get('range_impact', 0):.3f}")
+                logger.info(f"Max Precipitation: {precipitation.get('max_precipitation', 'N/A')} mm")
             
             # 7. Holt-Winters Penalty Breakdown
             hw_uncovered = param_data.get("holt_winters_uncovered", {})
             if hw_uncovered:
-                logger.info(f"\n  🔻 HOLT-WINTERS PENALTY BREAKDOWN:")
+                logger.info(f"\nHOLT-WINTERS PENALTY BREAKDOWN:")
                 total_penalty = sum(hw_uncovered.values())
-                logger.info(f"     • Total Penalty: {total_penalty:.2f}%")
+                logger.info(f"Total Penalty: {total_penalty:.2f}%")
                 
                 # Sort penalties by magnitude for better readability
                 for reason, penalty in sorted(hw_uncovered.items(), key=lambda x: x[1], reverse=True):
@@ -1253,16 +1323,16 @@ class NasaPreprocessor:
                     else:
                         display_name = reason.replace('_', ' ').title()
                     
-                    logger.info(f"     • {display_name}: -{penalty:.2f}%")
+                    logger.info(f"{display_name}: -{penalty:.2f}%")
             else:
-                logger.info(f"\n  ✅ HOLT-WINTERS: No penalties applied")
+                logger.info(f"\nHOLT-WINTERS: No penalties applied")
 
             # 8. LSTM Penalty Breakdown
             lstm_uncovered = param_data.get("lstm_uncovered", {})
             if lstm_uncovered:
-                logger.info(f"\n  🔻 LSTM PENALTY BREAKDOWN:")
+                logger.info(f"\nLSTM PENALTY BREAKDOWN:")
                 total_penalty = sum(lstm_uncovered.values())
-                logger.info(f"     • Total Penalty: {total_penalty:.2f}%")
+                logger.info(f"Total Penalty: {total_penalty:.2f}%")
                 
                 for reason, penalty in sorted(lstm_uncovered.items(), key=lambda x: x[1], reverse=True):
                     # Better formatting
@@ -1271,47 +1341,41 @@ class NasaPreprocessor:
                     else:
                         display_name = reason.replace('_', ' ').title()
                     
-                    logger.info(f"     • {display_name}: -{penalty:.2f}%")
+                    logger.info(f"{display_name}: -{penalty:.2f}%")
             else:
-                logger.info(f"\n  ✅ LSTM: No penalties applied")
+                logger.info(f"\nLSTM: No penalties applied")
             
             # 9. Data Quality Indicators
-            logger.info(f"\n  📋 DATA QUALITY INDICATORS:")
-            logger.info(f"     • Data Points: {analysis.get('data_points', len(processed_df))}")
-            logger.info(f"     • Missing Ratio: {analysis.get('missing_ratio', 0)*100:.2f}%")
+            logger.info(f"\nDATA QUALITY INDICATORS:")
+            logger.info(f"Data Points: {analysis.get('data_points', len(processed_df))}")
+            logger.info(f"Missing Ratio: {analysis.get('missing_ratio', 0)*100:.2f}%")
             if analysis.get("insufficient_data"):
-                logger.info(f"     ⚠️  WARNING: Insufficient data for full analysis")
+                logger.info(f"WARNING: Insufficient data for full analysis")
         
         # Global Uncovered Breakdown
-        logger.info("\n" + "="*80)
         logger.info("GLOBAL PENALTY AGGREGATION:")
-        logger.info("="*80)
-        
         hw_global = coverage_data.get("holt_winters", {}).get("uncovered_breakdown", {})
         lstm_global = coverage_data.get("lstm", {}).get("uncovered_breakdown", {})
         
         if hw_global:
-            logger.info(f"\n  🔻 Holt-Winters Average Penalties Across Parameters:")
+            logger.info(f"\nHolt-Winters Average Penalties Across Parameters:")
             for reason, penalty in sorted(hw_global.items(), key=lambda x: x[1], reverse=True):
-                logger.info(f"     • {reason.replace('_', ' ').title()}: -{penalty:.2f}%")
+                logger.info(f"{reason.replace('_', ' ').title()}: -{penalty:.2f}%")
         
         if lstm_global:
-            logger.info(f"\n  🔻 LSTM Average Penalties Across Parameters:")
+            logger.info(f"\nLSTM Average Penalties Across Parameters:")
             for reason, penalty in sorted(lstm_global.items(), key=lambda x: x[1], reverse=True):
-                logger.info(f"     • {reason.replace('_', ' ').title()}: -{penalty:.2f}%")
+                logger.info(f"{reason.replace('_', ' ').title()}: -{penalty:.2f}%")
         
         # Warnings Summary
         warnings = self.preprocessing_report.get("warnings", [])
         if warnings:
-            logger.info("\n" + "="*80)
-            logger.info("⚠️  WARNINGS SUMMARY:")
-            logger.info("="*80)
+            logger.info("WARNINGS SUMMARY:")
+            
             for i, warning in enumerate(warnings, 1):
                 logger.info(f"  {i}. {warning}")
-        
-        logger.info("\n" + "="*80)
         logger.info("END OF DETAILED COVERAGE ANALYSIS")
-        logger.info("="*80 + "\n")
+        
     
     def _calculate_trend_penalty(self, trend_preservation: float) -> float:
         """
@@ -1386,57 +1450,93 @@ class NasaPreprocessor:
             return 0.0
         
     def _optimize_parameter_alphas(self, df: pd.DataFrame) -> None:
-        logger.info("🔍 Starting adaptive alpha optimization...")
-        
+        logger.info("Starting adaptive alpha optimization...")
+
         params = self.options.get("columns_to_process", [])
-        alpha_range = self.options.get("alpha_optimization_range", [0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20])
-        
+        alpha_range = self.options.get(
+            "alpha_optimization_range",
+            [0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
+        )
+
         optimization_results = {}
-        
+
+        # Logging overview
+        logger.info(f"Alpha range for testing: {alpha_range}")
+        logger.info("Focus parameters: RH2M, ALLSKY_SFC_SW_DWN (target trend preservation >85%)")
+
         for param in params:
+
             if param not in df.columns:
                 continue
-            
+
             param_config = self.options.get("parameter_configs", {}).get(param, {})
 
-            # Determine smoothing method with proper fallback chain
+            # Determine smoothing method with fallback chain
             smoothing_method = param_config.get(
                 "smoothing_method",
                 self.options.get("smoothing_method", "exponential")
             )
 
-            # Skip if no smoothing or non-exponential
+            # Skip parameters without exponential smoothing
             if smoothing_method is None:
-                logger.info(f"  ⏭️  {param}: Skipping (no smoothing configured)")
+                logger.info(f"{param}: Skipping (no smoothing configured)")
                 continue
-                
-            if smoothing_method != "exponential":
-                logger.info(f"  ⏭️  {param}: Skipping (using {smoothing_method} method)")
-                continue
-            
-            optimal_alpha = self._find_optimal_alpha_for_parameter(df, param, alpha_range)
 
-            # Store in config - ensure parameter_configs exists
+            if smoothing_method != "exponential":
+                logger.info(f"{param}: Skipping (using {smoothing_method} method)")
+                continue
+
+            # Current alpha
+            current_alpha = param_config.get(
+                "exponential_alpha",
+                self.options.get("exponential_alpha", 0.20)
+            )
+
+            # Find optimal alpha
+            optimal_alpha = self._find_optimal_alpha_for_parameter(
+                df,
+                param,
+                alpha_range
+            )
+
+            # Ensure config structure exists
             if "parameter_configs" not in self.options:
                 self.options["parameter_configs"] = {}
 
-            # Initialize parameter config if not exists
             if param not in self.options["parameter_configs"]:
                 self.options["parameter_configs"][param] = {}
 
             # Update alpha
             self.options["parameter_configs"][param]["exponential_alpha"] = optimal_alpha
-            optimization_results[param] = optimal_alpha
 
-            logger.info(f"Optimal α={optimal_alpha:.3f} for {param}")
+            optimization_results[param] = {
+                "original_alpha": current_alpha,
+                "optimized_alpha": optimal_alpha,
+                "improvement": f"alpha {current_alpha:.3f} -> {optimal_alpha:.3f}"
+            }
 
-            # Store results in report
-            self.preprocessing_report["alpha_optimization"] = optimization_results
-            logger.info(f"Alpha optimization complete: {len(optimization_results)} parameters optimized")
-        
-        # Store results
+            # Logging results
+            if optimal_alpha > current_alpha:
+                logger.info(
+                    f"{param}: alpha {current_alpha:.3f} -> {optimal_alpha:.3f} "
+                    "(increased for better trend preservation)"
+                )
+            elif optimal_alpha < current_alpha:
+                logger.info(
+                    f"{param}: alpha {current_alpha:.3f} -> {optimal_alpha:.3f} "
+                    "(reduced for better smoothing balance)"
+                )
+            else:
+                logger.info(
+                    f"{param}: alpha {current_alpha:.3f} unchanged (optimal)"
+                )
+
+        # Store results in report
         self.preprocessing_report["alpha_optimization"] = optimization_results
-        logger.info(f"Alpha optimization complete")
+
+        logger.info(
+            f"Alpha optimization complete: {len(optimization_results)} parameters optimized"
+        )
         
     def _find_optimal_alpha_for_parameter(
         self,
@@ -1445,57 +1545,75 @@ class NasaPreprocessor:
         alpha_range: List[float]
     ) -> float:
         """
-        Test multiple alpha values and return the optimal one
-        Scoring: (trend_preservation * 100) - (GCV * 0.5)
+        Test multiple alpha values and return the optimal one.
+
+        Scoring:
+        - Standard parameters: (trend_preservation * 1.0) - (GCV * 0.5)
+        - Problematic parameters (RH2M, ALLSKY_SFC_SW_DWN):
+        (trend_preservation * 1.5) - (GCV * 0.3)
         """
-        
+
         if param not in df.columns:
             logger.warning(f"Parameter {param} not in dataframe - using default alpha")
-            return self.options.get("exponential_alpha", 0.15)
-        
+            return self.options.get("exponential_alpha", 0.20)
+
         series = df[param].dropna()
-        
-        # Check minimum data requirement (lowered threshold for better coverage)
-        if len(series) < 100:  # Need at least 100 points for meaningful optimization
-            logger.warning(f"Parameter {param}: insufficient data ({len(series)} points < 100) - using default alpha")
-            return self.options.get("exponential_alpha", 0.15)
-        
-        # Initialize with global default
-        best_alpha = self.options.get("exponential_alpha", 0.15)
+
+        # Minimum data requirement
+        if len(series) < 100:
+            logger.warning(
+                f"Parameter {param}: insufficient data ({len(series)} points < 100) - using default alpha"
+            )
+            return self.options.get("exponential_alpha", 0.20)
+
+        # Higher defaults for problematic parameters
+        if param in ["RH2M", "ALLSKY_SFC_SW_DWN"]:
+            best_alpha = 0.30
+        else:
+            best_alpha = self.options.get("exponential_alpha", 0.20)
+
         best_score = -np.inf
         test_results = []
-        
-        logger.info(f"     Testing {len(alpha_range)} alpha values...")
-        
+
+        logger.info(f"     Testing {len(alpha_range)} alpha values for {param}...")
+
         for alpha in alpha_range:
+
             performance = self._test_alpha_performance(series.values, alpha)
-            
+
             if performance is None:
                 continue
-            
+
             gcv_score = performance.get("gcv_score", 10.0)
             trend_pct = performance.get("trend_preservation_pct", 0.0)
-            
-            # Scoring: prioritize trend preservation
-            combined_score = (trend_pct * 1.0) - (gcv_score * 0.5)
-            
+
+            # Enhanced scoring
+            if param in ["RH2M", "ALLSKY_SFC_SW_DWN"]:
+                combined_score = (trend_pct * 1.5) - (gcv_score * 0.3)
+            else:
+                combined_score = (trend_pct * 1.0) - (gcv_score * 0.5)
+
             test_results.append({
                 "alpha": alpha,
                 "gcv": gcv_score,
                 "trend": trend_pct,
                 "score": combined_score
             })
-            
-            logger.info(f"     α={alpha}: GCV={gcv_score:.4f}, Trend={trend_pct:.1f}%, Score={combined_score:.2f}")
-            
+
+            logger.info(
+                f"{param} α={alpha}: GCV={gcv_score:.4f}, Trend={trend_pct:.1f}%, Score={combined_score:.2f}"
+            )
+
             if combined_score > best_score:
                 best_score = combined_score
                 best_alpha = alpha
-        
+
         if test_results:
             best_result = max(test_results, key=lambda x: x["score"])
-            logger.info(f"     🏆 BEST: α={best_result['alpha']}, Trend={best_result['trend']:.1f}%")
-        
+            logger.info(
+                f"BEST for {param}: α={best_result['alpha']}, Trend={best_result['trend']:.1f}%"
+            )
+
         return best_alpha
 
     def _test_alpha_performance(
@@ -1823,11 +1941,17 @@ class NasaPreprocessor:
     
     def _apply_smoothing(self, df: pd.DataFrame) -> pd.DataFrame:
         """Apply smoothing to appropriate parameters"""
-        logger.info("Applying smoothing methods...")
-        
+        logger.info("Applying conditional smoothing methods...")
         params = self.options.get("columns_to_process", [])
         smoothing_method = self.options.get("smoothing_method", "exponential")
         smoothing_summary = {}
+        
+        # Track smoothing decisions for better reporting
+        smoothing_decisions = {
+            "smoothed": [],
+            "skipped": [],
+            "reasons": {}
+        }
         
         for param in params:
             if param not in df.columns:
@@ -1837,25 +1961,52 @@ class NasaPreprocessor:
             param_config = self.options.get("parameter_configs", {}).get(param, {})
             param_smoothing = param_config.get("smoothing_method", smoothing_method)
             
+            # Get reason for detailed logging
+            reason = param_config.get("reason", "default configuration")
+            
             if param_smoothing is None:
-                # Skip smoothing for this parameter (e.g., PRECTOTCORR)
+                # Skip smoothing for this parameter
+                logger.info(f"{param}: Skipping smoothing - {reason}")
                 smoothing_summary[param] = "none"
+                smoothing_decisions["skipped"].append(param)
+                smoothing_decisions["reasons"][param] = reason
                 continue
             
-            # Apply smoothing
-            if param_smoothing == "moving_average":
+            # Get alpha for logging
+            if param_smoothing == "exponential":
+                alpha = param_config.get("exponential_alpha", self.options.get("exponential_alpha", 0.15))
+                logger.info(f"  {param}: Smoothing (α={alpha:.3f}) - {reason}")
+                
+                df[param] = self._smooth_exponential(df[param], param)
+                smoothing_summary[param] = f"exponential (α={alpha:.3f})"
+                smoothing_decisions["smoothed"].append(param)
+                smoothing_decisions["reasons"][param] = f"α={alpha:.3f}, {reason}"
+                
+            elif param_smoothing == "moving_average":
+                window = self.options.get("window_size", 5)
+                logger.info(f"  {param}: Moving average (window={window}) - {reason}")
+                
                 df[param] = self._smooth_moving_average(df[param])
-                smoothing_summary[param] = "moving_average"
-            elif param_smoothing == "exponential":
-                df[param] = self._smooth_exponential(df[param], param)  # Pass param
-                smoothing_summary[param] = "exponential"
+                smoothing_summary[param] = f"moving_average (w={window})"
+                smoothing_decisions["smoothed"].append(param)
+                smoothing_decisions["reasons"][param] = f"window={window}, {reason}"
         
+        # Enhanced reporting with decision tracking
         self.preprocessing_report["smoothing"] = {
-            "method": smoothing_method,
-            "parameters_smoothed": smoothing_summary
+            "method": "conditional",  # Changed from single method
+            "parameters_smoothed": smoothing_summary,
+            "decisions": smoothing_decisions,
+            "summary": {
+                "total_parameters": len(params),
+                "smoothed_count": len(smoothing_decisions["smoothed"]),
+                "skipped_count": len(smoothing_decisions["skipped"])
+            }
         }
         
-        logger.info(f"Smoothing applied: {smoothing_summary}")
+        # Summary logging
+        logger.info(f"Conditional smoothing completed:")
+        logger.info(f"  - Smoothed: {len(smoothing_decisions['smoothed'])} parameters")
+        logger.info(f"  - Skipped: {len(smoothing_decisions['skipped'])} parameters")
         
         return df
     
@@ -1863,9 +2014,8 @@ class NasaPreprocessor:
         """
         Validate smoothing quality using GCV + Trend Preservation
         """
-        
         logger.info("Validating smoothing quality...")
-        
+    
         params = self.options.get("columns_to_process", [])
         validation_results = {}
         
@@ -1886,31 +2036,58 @@ class NasaPreprocessor:
                 }
                 continue
             
-            # Get original and smoothed values
-            if self.original_data is None or param not in self.original_data.columns:
-                logger.warning(f"Original data not available for {param}")
-                validation_results[param] = {
-                    "status": "missing_original_data",
-                    "gcv": None,
-                    "trend_preservation": None
-                }
-                continue        
+            # CRITICAL FIX: Use correct baseline for comparison
+            # Use pre-smoothing data (after outliers, before smoothing) vs post-smoothing
+            if hasattr(self, 'pre_smoothing_data') and self.pre_smoothing_data is not None and param in self.pre_smoothing_data.columns:
+                # Compare pre-smoothing vs post-smoothing
+                original = self.pre_smoothing_data[param].dropna()
+                baseline_source = "pre_smoothing_data"
+            else:
+                # Use original data (should not happen with proper flow)
+                logger.warning(f"Pre-smoothing data not available for {param} - using raw original data")
+                if self.original_data is None or param not in self.original_data.columns:
+                    logger.warning(f"Original data not available for {param}")
+                    validation_results[param] = {
+                        "status": "missing_baseline_data",
+                        "gcv": None,
+                        "trend_preservation": None
+                    }
+                    continue
+                original = self.original_data[param].dropna()
+                baseline_source = "original_data"
             
-            original = self.original_data[param].dropna()    
-            smoothed = df[param].dropna()    
+            # Post-smoothing data
+            smoothed = df[param].dropna()
+            
+            # Log data source for verification
+            logger.info(f"TREND VALIDATION {param}: Using baseline = {baseline_source}")
+            logger.info(f"TREND VALIDATION {param}: Pre-smoothing points = {len(original)}, Post-smoothing points = {len(smoothed)}")
             
             # Align indices 
             common_idx = original.index.intersection(smoothed.index)
             if len(common_idx) == 0:
-                logger.warning(f"No common indices found between original and smoothed data for {param}")
+                logger.warning(f"No common indices found between baseline and smoothed data for {param}")
                 validation_results[param] = {
                     "status": "no_common_indices",
                     "gcv": None,
                     "trend_preservation": None
                 }
                 continue
+                
             original_aligned = original.loc[common_idx]
             smoothed_aligned = smoothed.loc[common_idx]
+            
+            # Log sample comparison for verification
+            if len(original_aligned) >= 10:
+                logger.info(f"SAMPLE COMPARISON {param}:")
+                logger.info(f"    Pre-smoothing  first 5: {original_aligned.head(5).round(3).tolist()}")
+                logger.info(f"    Post-smoothing first 5: {smoothed_aligned.head(5).round(3).tolist()}")
+                
+                # Calculate sample difference
+                sample_diff = abs(original_aligned.head(10).values - smoothed_aligned.head(10).values)
+                avg_change = sample_diff.mean()
+                max_change = sample_diff.max()
+                logger.info(f"    Average change: {avg_change:.4f}, Max change: {max_change:.4f}")
             
             # Check if enough data
             if len(common_idx) < 30:
@@ -1935,6 +2112,9 @@ class NasaPreprocessor:
                 smoothed_aligned.values
             )
             
+            # Log intermediate calculations for verification
+            logger.info(f"CALCULATIONS {param}: GCV={gcv_score:.4f}, Trend={trend_agreement:.4f} ({trend_agreement*100:.2f}%)")
+            
             # 3. Determine quality 
             quality_status = self._determine_smoothing_quality(
                 gcv_score,
@@ -1946,7 +2126,8 @@ class NasaPreprocessor:
                 "trend_preservation_pct": round(float(trend_agreement * 100), 2),
                 "quality_status": quality_status,
                 "smoothing_method": param_smoothing_applied,
-                "data_points": len(common_idx)
+                "data_points": len(common_idx),
+                "baseline_source": baseline_source  # Track which baseline was used
             }
             
             # Log individual parameter results
@@ -1954,7 +2135,8 @@ class NasaPreprocessor:
                 f"Parameter {param}: "
                 f"GCV={gcv_score:.4f}, "
                 f"Trend={trend_agreement*100:.2f}%, "
-                f"Quality={quality_status.upper()}"
+                f"Quality={quality_status.upper()}, "
+                f"Baseline={baseline_source}"
             )
             
             # Add warnings if quality is poor
@@ -1970,20 +2152,25 @@ class NasaPreprocessor:
         
     def _determine_smoothing_quality(self, gcv: float, trend_preservation: float) -> str:
         """
-        Determine overall smoothing quality based on GCV and trend preservation
+        Determine overall smoothing quality based on GCV and windowed trend preservation
+        
+        Updated thresholds for windowed trend agreement (typically higher values):
+        - Windowed trend preservation focuses on weekly patterns vs daily noise
+        - Expect 85-95% agreement for good smoothing vs 60-70% with daily comparison
         
         Args:
-            gcv: Generalized Cross-Validation score (lower = better)
-            trend_preservation: Trend agreement ratio (0.0 to 1.0, higher = better)
+            gcv: Generalized Cross-Validation score (lower = better)  
+            trend_preservation: Windowed trend agreement ratio (0.0 to 1.0, higher = better)
         
         Returns:
             Quality status: "excellent", "good", "fair", "poor"
         """
-        if gcv < 2.0 and trend_preservation > 0.80:
+        # Higher thresholds for windowed trend preservation
+        if gcv < 2.0 and trend_preservation > 0.85:
             return "excellent"
-        elif gcv < 4.0 and trend_preservation > 0.75:
+        elif gcv < 4.0 and trend_preservation > 0.80:
             return "good"
-        elif gcv < 10.0 and trend_preservation > 0.70:
+        elif gcv < 10.0 and trend_preservation > 0.75:
             return "fair"
         else:
             return "poor"
@@ -2116,13 +2303,23 @@ class NasaPreprocessor:
     
     def _calculate_trend_preservation(self, original: np.ndarray, smoothed: np.ndarray) -> float:
         """
-        Calculate trend direction agreement between original and smoothed data
+        Calculate windowed trend direction agreement between original and smoothed data.
         
-        Returns: percentage of matching trend directions (0.0 to 1.0)
+        Uses moving average windows to compare trend directions, making the metric
+        less sensitive to daily fluctuations and more focused on meaningful patterns.
         
-        Special cases:
-        - Returns 1.0 if data is flat (no trends to preserve = perfect preservation)
-        - Returns np.nan if insufficient data for meaningful calculation
+        Args:
+            original: Original data array (after imputation & outliers, before smoothing)
+            smoothed: Smoothed data array
+            
+        Returns:
+            Trend agreement ratio (0.0 to 1.0) - higher values indicate better preservation
+            
+        Algorithm:
+        1. Apply 7-day moving average to both series to smooth daily noise
+        2. Calculate direction changes on the smoothed moving averages  
+        3. Compare direction agreement, ignoring flat periods
+        4. Return percentage of matching directions as ratio (0-1)
         """
         # Validate input lengths
         if len(original) != len(smoothed):
@@ -2133,30 +2330,51 @@ class NasaPreprocessor:
             logger.warning(f"Trend preservation: insufficient data (n={len(original)})")
             return np.nan
         
-        # Calculate first differences (trend direction)
-        original_diff = np.diff(original)
-        smoothed_diff = np.diff(smoothed)
+        window = self.options.get("trend_window_size", 7)  # Default 7 days
+
+        if len(original) < window + 1:
+            logger.debug(f"Trend preservation: data too short for {window}-day window (n={len(original)}) - assuming perfect")
+            return 1.0
+
+        # Calculate moving averages to smooth daily fluctuations
+        orig_ma = pd.Series(original).rolling(window, center=True, min_periods=1).mean().values
+        smooth_ma = pd.Series(smoothed).rolling(window, center=True, min_periods=1).mean().values
         
-        # Get signs (direction: +1 for increase, -1 for decrease, 0 for no change)
+        # Remove any NaN values that might occur at edges
+        valid = ~(np.isnan(orig_ma) | np.isnan(smooth_ma))
+        orig_ma = orig_ma[valid]
+        smooth_ma = smooth_ma[valid]
+        
+        if len(orig_ma) < 2:
+            logger.debug(f"Trend preservation: insufficient valid data after windowing (n={len(orig_ma)})")
+            return 1.0  # Assume perfect for very short series
+        
+        # Calculate trend directions on moving averages (less noisy than daily changes)
+        original_diff = np.diff(orig_ma)
+        smoothed_diff = np.diff(smooth_ma)
+        
+        # Get trend directions (+1 for increase, -1 for decrease, 0 for flat)
         original_direction = np.sign(original_diff)
         smoothed_direction = np.sign(smoothed_diff)
         
-        # Calculate agreement (exclude zeros - flat regions)
+        # Exclude flat periods where both directions are zero
         non_zero_mask = (original_direction != 0) & (smoothed_direction != 0)
         
         if non_zero_mask.sum() == 0:
-            # No clear trends in data (all flat) - this is GOOD, not bad!
-            # Flat data means smoothing preserved the flat nature perfectly
-            logger.debug(f"Trend preservation: No clear trends detected (flat data) - returning 1.0 (perfect)")
-            return 1.0  # ← FIXED: was 0.0
+            # No clear trends detected in windowed data (all flat periods)
+            # This indicates very stable data - smoothing preserved stability perfectly
+            logger.debug(f"Trend preservation: No clear trends in {window}-day windows (stable data) - returning 1.0 (perfect)")
+            return 1.0
         
-        if non_zero_mask.sum() < 10:  # Too few trend changes for reliable calculation
-            logger.debug(f"Trend preservation: Very few trend changes ({non_zero_mask.sum()}) - may be unreliable")
-            # Still calculate but warn
+        if non_zero_mask.sum() < 5:  # Very few trend changes in windowed data
+            logger.debug(f"Trend preservation: Very few windowed trend changes ({non_zero_mask.sum()}) - may indicate stable data")
         
-        # Check where directions match
+        # Calculate agreement between trend directions
         agreement = (original_direction[non_zero_mask] == smoothed_direction[non_zero_mask])
         trend_preservation = agreement.mean()
+        
+        # Log debug info for verification
+        logger.debug(f"Windowed trend analysis: {non_zero_mask.sum()} trend changes, {trend_preservation:.3f} agreement")
         
         return trend_preservation
     
@@ -2177,7 +2395,7 @@ class NasaPreprocessor:
             alpha = param_config.get("exponential_alpha", self.options.get("exponential_alpha", 0.15))
         else:
             alpha = self.options.get("exponential_alpha", 0.15)
-        return series.ewm(alpha=alpha, adjust=False).mean()
+        return series.ewm(alpha=alpha, adjust=True).mean()
     
     def _generate_quality_metrics(self, original_df: pd.DataFrame, processed_df: pd.DataFrame) -> None:
         """Generate quality metrics for preprocessing report"""
@@ -2204,26 +2422,21 @@ class NasaPreprocessor:
         }
         
         logger.info(f"Quality metrics: {completeness:.2f}% complete, {records_removed} records removed")
-        
-
-    def _calculate_seasonal_decomposition(
-        self,
-        df: pd.DataFrame
-    ) -> Dict[str, pd.DataFrame]:
+    
+    def _calculate_and_embed_decomposition(self, df: pd.DataFrame) -> None:
         """
-        Calculate seasonal decomposition for all valid parameters
-        Decomposition can be performed on both smoothed and non-smoothed data
+        Calculate seasonal decomposition and embed in preprocessing report
         """
         logger.info("Calculating seasonal decomposition for time series...")
         
         params = self.options.get("columns_to_process", [])
-        decomposition_results = {}
+        decomposition_data = {
+            "parameters_decomposed": [],
+            "decomposition_data": {}
+        }
         
         # Get smoothing summary to log which parameters were smoothed
         smoothing_summary = self.preprocessing_report.get("smoothing", {}).get("parameters_smoothed", {})
-        
-        # CHANGED: Remove exclusion for non-smoothed parameters
-        # We want to decompose all parameters regardless of smoothing
         
         for param in params:
             if param not in df.columns:
@@ -2255,19 +2468,40 @@ class NasaPreprocessor:
                     extrapolate_trend='freq'
                 )
                 
-                # Create decomposition dataframe
-                decomp_df = pd.DataFrame({
-                    'Date': series.index.map(lambda idx: df.loc[idx, 'Date']),
-                    'parameter': param,
-                    'original': series.values,
-                    'trend': decomposition.trend.values,
-                    'seasonal': decomposition.seasonal.values,
-                    'residual': decomposition.resid.values
-                })
+                # Calculate seasonal strength
+                seasonal_var = np.var(decomposition.seasonal.dropna())
+                residual_var = np.var(decomposition.resid.dropna())
                 
-                decomposition_results[param] = decomp_df
+                if seasonal_var + residual_var == 0:
+                    seasonal_strength = 0
+                else:
+                    seasonal_strength = seasonal_var / (seasonal_var + residual_var)
                 
-                logger.info(f"{param}: Decomposition completed ({len(decomp_df)} data points, {data_type} data)")
+                # Create decomposition data for embedding
+                decomp_data = []
+                for i in range(len(series)):
+                    date_val = df.loc[series.index[i], 'Date']
+                    decomp_data.append({
+                        "date": date_val.isoformat() if hasattr(date_val, 'isoformat') else str(date_val),
+                        "original": float(series.iloc[i]) if pd.notna(series.iloc[i]) else None,
+                        "trend": float(decomposition.trend.iloc[i]) if pd.notna(decomposition.trend.iloc[i]) else None,
+                        "seasonal": float(decomposition.seasonal.iloc[i]) if pd.notna(decomposition.seasonal.iloc[i]) else None,
+                        "residual": float(decomposition.resid.iloc[i]) if pd.notna(decomposition.resid.iloc[i]) else None
+                    })
+                
+                # Store in report structure
+                decomposition_data["decomposition_data"][param] = {
+                    "method": "additive",
+                    "period": 365,
+                    "data_points": len(series),
+                    "seasonal_strength": round(float(seasonal_strength), 3),
+                    "data_type": data_type,
+                    "data": decomp_data
+                }
+                
+                decomposition_data["parameters_decomposed"].append(param)
+                
+                logger.info(f"{param}: Decomposition completed ({len(decomp_data)} data points, {data_type} data)")
                 
             except Exception as e:
                 logger.error(f"{param}: Decomposition failed - {str(e)}")
@@ -2276,57 +2510,54 @@ class NasaPreprocessor:
                 )
                 continue
         
-        logger.info(f"Seasonal decomposition completed for {len(decomposition_results)} parameters")
-        return decomposition_results
-
-    def _save_decomposition_to_mongodb(
+        # Embed decomposition in preprocessing report
+        self.preprocessing_report["decomposition"] = decomposition_data
+        
+        logger.info(f"Seasonal decomposition embedded for {len(decomposition_data['parameters_decomposed'])} parameters")
+        
+    def _save_preprocessing_report(
         self,
-        decomposition_results: Dict[str, pd.DataFrame],
-        cleaned_collection_name: str
-    ) -> Dict[str, Any]:
+        collection_name: str,
+    )-> Dict[str, Any]:
         """
-        Save decomposition results to MongoDB
-        Creates collection: {cleaned_collection_name}_decomposition
+        Save unified processing report to preprocessing_report collection
         """
         try:
-            if not decomposition_results:
-                logger.info("No decomposition results to save")
-                return {"status": "no_data"}
-            
-            # Generate decomposition collection name
-            decomp_collection_name = f"{cleaned_collection_name}_decomposition"
-            
-            # Drop existing collection if exists
-            if decomp_collection_name in self.db.list_collection_names():
-                logger.info(f"Dropping existing decomposition collection: {decomp_collection_name}")
-                self.db[decomp_collection_name].drop()
-            
-            # Combine all parameter decompositions
-            all_records = []
-            for param, decomp_df in decomposition_results.items():
-                records = decomp_df.to_dict('records')
-                all_records.extend(records)
-            
-            if all_records:
-                # Insert into MongoDB
-                self.db[decomp_collection_name].insert_many(all_records)
-                
-                # Create index on parameter and Date for fast queries
-                self.db[decomp_collection_name].create_index([("parameter", 1), ("Date", 1)])
-                
-                logger.info(f"Saved {len(all_records)} decomposition records to '{decomp_collection_name}'")
-                
-                return {
-                    "status": "success",
-                    "collection_name": decomp_collection_name,
-                    "records_saved": len(all_records),
-                    "parameters_decomposed": list(decomposition_results.keys())
+            # Prepare report document
+            report_doc = {
+                "dataset_type": "nasa",
+                "original_collection_name": self.collection_name,
+                "cleaned_collection_name": collection_name,
+                "preprocessing_timestamp": datetime.now(),
+                "processing_options": self.options,
+                "report_data": self.preprocessing_report,
+                "status": "success",
+                "processing_duration_seconds": None,  # Could be calculated if needed
+                "record_count": {
+                    "original": len(self.original_data) if self.original_data is not None else 0,
+                    "processed": self.preprocessing_report.get("quality_metrics", {}).get("processed_records", 0)
                 }
-            else:
-                return {"status": "no_records"}
-                
+            }
+            
+            # Sanitize for MongoDB 
+            sanitized_document = self._sanitize_for_mongodb(report_doc)
+            
+            # insert into preprocessing_report collection
+            result = self.db["preprocessing_report"].insert_one(sanitized_document)
+            
+            logger.info(f"Preprocessing report saved with ID: {result.inserted_id}")
+            
+            return {
+                "status": "success",
+                "report_id": str(result.inserted_id),
+                "collection": "preprocessing_report"
+            }
+            
+            
         except Exception as e:
-            error_msg = f"Error saving decomposition data: {str(e)}"
+            error_msg = f"Error saving preprocessing report: {str(e)}"
             logger.error(error_msg)
-            return {"status": "error", "error": str(e)}
-    
+            return {
+                "status": "error",
+                "error": str(e)
+            }
