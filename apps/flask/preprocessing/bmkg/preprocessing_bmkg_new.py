@@ -1,4 +1,5 @@
 from typing import Dict, List, Any, Optional
+from certifi import where
 from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.stattools import adfuller
 from datetime import datetime
@@ -676,6 +677,9 @@ class BmkgPreprocessor:
             'FF_X', 'FF_AVG', 'DDD_X', 'SS', 'DDD_CAR'
         ]
         
+        # Track imputation confidence
+        self.imputation_confidence = {}
+        
         # Preprocessing report (NASA-style structure)
         self.preprocessing_report = {
             "missing_data": {},
@@ -703,8 +707,7 @@ class BmkgPreprocessor:
             'DDD_CAR': 'mode_based'
         }
         return method_map.get(param, 'unknown') 
-    
-    
+ 
     def preprocess(
         self,
         options: Dict[str, Any] = None
@@ -721,10 +724,7 @@ class BmkgPreprocessor:
         
         try:
             start_time = datetime.now()
-            logger.info("BMKG DATA PREPROCESSING PIPELINE")
-            
-            
-            # Merge options
+            logger.info("PROGRESS: Starting BMKG preprocessing pipeline...")
             self.options = self._get_default_options()
             if options: 
                 self.options.update(options)
@@ -784,8 +784,12 @@ class BmkgPreprocessor:
                 self.db,
                 processed_df,
                 self.collection_name
+            )            
+            cleaned_collection = save_result.get("preprocessedCollections", [])[0] if save_result.get("preprocessedCollections") else None
+            
+            report_save_result = self._save_preprocessing_report(
+                cleaned_collection or self.collection_name
             )
-            logger.info(f"Saved to collection: {save_result['preprocessedCollections'][0]}")
             
             # Generate final report 
             end_time = datetime.now()
@@ -797,7 +801,7 @@ class BmkgPreprocessor:
             logger.info("PREPROCESSING COMPLETED SUCCESSFULLY")
             logger.info(f"Processing time: {processing_time:.2f}s")
             logger.info(f"Records processed: {len(processed_df)}")
-            logger.info(f"Cleaned collection: {save_result['preprocessedCollections'][0]}")
+            logger.info(f"Cleaned collection: {cleaned_collection}")
             
             return {
                 "status": "success",
@@ -807,12 +811,13 @@ class BmkgPreprocessor:
                 "recordCount": len(processed_df),
                 "originalRecordCount": original_record_count,
                 "preprocessedCollections": save_result.get("preprocessedCollections", []),
-                "cleanedCollection": save_result.get("preprocessedCollections", [])[0] 
-                                    if save_result.get("preprocessedCollections") else None,
+                "cleanedCollection": cleaned_collection,
                 "processingTime": round(processing_time, 2),
-                "preprocessing_report": self.preprocessing_report,
+                "preprocessing_report": self._sanitize_for_mongodb(self.preprocessing_report),  # Sanitized report
                 "validation_result": validation_result,
-                "metadata": save_result.get("metadata", {})
+                "metadata": save_result.get("metadata", {}),
+                "report_saved": report_save_result.get("status") == "success",
+                "report_id": report_save_result.get("report_id")
             }
         except Exception as e:
             error_msg = f"Error during preprocessing: {str(e)}"
@@ -831,7 +836,7 @@ class BmkgPreprocessor:
             # Outlier detection settings
             "detect_outliers": True,
             "outlier_methods": ["iqr", "zscore"],
-            "iqr_multiplier": 2.0,
+            "iqr_multiplier": 2.5,
             "zscore_threshold": 3.5,
             "outlier_treatment": "interpolate",
             
@@ -923,43 +928,50 @@ class BmkgPreprocessor:
         5. Impute missing values
         6. Apply physical constraints
         """
+        logger.info("PROGRESS: Starting preprocessing steps...")
         logger.info("Starting preprocessing steps")
         processed_df = df.copy()
-        
+            
         # Step 1: Prepare temporal features
+        logger.info("[1/7] Preparing temporal features...")
         processed_df = self._prepare_temporal_features(processed_df)
-
+        
         # Step 2: Replace fill values
+        logger.info("[2/7] Replacing fill values...")
         processed_df = self._replace_fill_values(processed_df)
 
         # Step 2.5: Detect and fix suspicious zeros in wind data (NEW)
-        logger.info("  [2.5/6] Detecting suspicious zeros...")
+        logger.info("[2.5/7] Detecting suspicious zeros...")
         processed_df = self._detect_and_fix_suspicious_zeros(processed_df)
 
         # Save original_data AFTER fill values replaced and suspicious zeros fixed
         cols_to_keep = [col for col in processed_df.columns 
                         if col not in ['Season', 'Month', 'is_RR_missing']]
         self.original_data = processed_df[cols_to_keep].copy()
-        logger.info(f"    Saved original data reference with DatetimeIndex (shape: {self.original_data.shape})")
+        logger.info(f"Saved original data reference with DatetimeIndex (shape: {self.original_data.shape})")
         
         # Step 3: Detect gaps
         if self.options.get("detect_gaps", True):
-            logger.info("  [3/6] Detecting gaps...")
+            logger.info("[3/7] Detecting gaps...")
             self._detect_gaps(processed_df)
         
         # Step 4: Detect and handle outliers
         if self.options.get("detect_outliers", True):
-            logger.info("  [4/6] Detecting and handling outliers...")
+            logger.info("[4/7] Detecting and handling outliers...")
             processed_df = self._handle_outliers(processed_df)
         
         # Step 5: Impute missing values with gap-aware wind handling (MODIFIED)
         if self.options.get("fill_missing", True):
-            logger.info("  [5/6] Imputing missing values with gap-aware logic")
+            logger.info("[5/7] Imputing missing values with gap-aware logic")
             processed_df = self._impute_missing_values(processed_df)
         
         # Step 6: Apply physical constraints
-        logger.info("  [6/6] Applying physical constraints...")
+        logger.info("[6/7] Applying physical constraints...")
         processed_df = self._apply_physical_constraints(processed_df)
+        
+        # Step 7 : Calculate and embed STL decomposition 
+        logger.info("[7/7] Calculating and embedding STL decomposition...")
+        self._calculate_and_embed_decomposition(processed_df)
         
         logger.info("preprocessing pipeline completed")
         return processed_df
@@ -1249,7 +1261,7 @@ class BmkgPreprocessor:
                 Q3 = df[param].quantile(0.75)
                 IQR = Q3 - Q1
                 
-                k = self.options.get("iqr_multiplier", 2.0)
+                k = self.options.get("iqr_multiplier", 2.5)
                 lower_bound = Q1 - k * IQR
                 upper_bound = Q3 + k * IQR
                 
@@ -1460,6 +1472,7 @@ class BmkgPreprocessor:
         missing_mask = df['RR'].isna()
         classified_rain = 0
         classified_dry = 0
+        confidence_scores = []
         
         for idx in df.index[missing_mask]:
             # Method 1: Seasonal probability
@@ -1487,6 +1500,12 @@ class BmkgPreprocessor:
                 0.25 * context_prob
             )
             
+            # Confidence = how certain we are about the classification
+            # High probability (close to 0 or 1) = high confidence
+            # Probability around 0.5 = low confidence
+            confidence = 1 - (2 * abs(final_probability - 0.5))  # 0.5 = maximum uncertainty
+            confidence_scores.append(confidence)
+                
             # DECISION: Rain or No Rain
             if final_probability > 0.5:
                 # Classify as rain day - will get amount in Stage 2
@@ -1497,6 +1516,12 @@ class BmkgPreprocessor:
                 df.loc[idx, 'RR'] = 0
                 df.loc[idx, 'rain_classified'] = 0
                 classified_dry += 1
+                
+        if confidence_scores:
+            avg_confidence = np.mean(confidence_scores)
+            self.imputation_confidence['RR'] = avg_confidence
+            
+            logger.info(f"RR classification confidence: {avg_confidence:.3f} (1.0=certain, 0.0=uncertain)")
         
         logger.info(f"Binary classification results:")
         logger.info(f"Classified as rain days: {classified_rain}")
@@ -2048,6 +2073,12 @@ class BmkgPreprocessor:
                 
                 logger.info(f"Interpolated remaining {param} values")
         
+        for temp_param in ['TX', 'TN', 'TAVG']:
+            if temp_param in df.columns:
+                confidence = self._calculate_interpolation_confidence(df, temp_param)
+                self.imputation_confidence[temp_param] = confidence
+                logger.debug(f"{temp_param} imputation confidence: {confidence:.3f}")
+        
         return df
 
     def _impute_humidity(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -2056,7 +2087,6 @@ class BmkgPreprocessor:
         
         Dewpoint formula: Td ≈ T - ((100 - RH) / 5)
         """
-        
         # Calculate dewpoint where both TAVG and RH_AVG are available
         mask = df['RH_AVG'].notna() & df['TAVG'].notna()
         
@@ -2082,8 +2112,13 @@ class BmkgPreprocessor:
         # Apply physical constraints (0-100%)
         df['RH_AVG'] = df['RH_AVG'].clip(0, 100)
         
+        # NEW: Calculate and store confidence for uncertainty penalty
+        if 'RH_AVG' in df.columns:
+            confidence = self._calculate_interpolation_confidence(df, 'RH_AVG')
+            self.imputation_confidence['RH_AVG'] = confidence
+            logger.debug(f"RH_AVG imputation confidence: {confidence:.3f}")
+        
         return df
-
     
     def _impute_wind_speed_gap_aware(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -3117,6 +3152,8 @@ class BmkgPreprocessor:
             logger.info(f"Average GCV Score: {avg_gcv:.4f}")
         if avg_trend is not None:
             logger.info(f"Average Trend Preservation: {avg_trend:.2f}%")
+            
+            
     def _calculate_model_coverage(self, df: pd.DataFrame) -> None:
         """
         Calculate coverage for Holt-Winters and LSTM models
@@ -3246,6 +3283,7 @@ class BmkgPreprocessor:
         
         logger.info(f"\n  Overall HW Coverage: {overall_hw:.2f}%")
         logger.info(f"  Overall LSTM Coverage: {overall_lstm:.2f}%")
+        
     def _analyze_seasonality(
         self,
         df: pd.DataFrame,
@@ -3559,6 +3597,165 @@ class BmkgPreprocessor:
             "trend_value": trend_preservation,  # For trend penalty calculation
             "message": f"GCV={gcv_score:.4f}, Trend={trend_preservation:.2f}%"
         }
+        
+    def _calculate_and_embed_decomposition(
+        self,
+        df: pd.DataFrame
+    )-> None:
+        """
+        Calculate STL seasonal decomposition and embed results in preprocessing report
+        
+        Key Differences from NASA:
+        - Uses STL decomposition (more robust for outliers)
+        - Handles Indonesian wet/dry seasonal patterns  
+        - Parameters: ['RR', 'TX', 'TN', 'TAVG', 'RH_AVG', 'FF_X', 'FF_AVG', 'DDD_X', 'SS']
+        """
+        logger.info("Calculating STL decomposition for BMKG...")
+        
+        params = ['RR', 'TX', 'TN', 'TAVG', 'RH_AVG', 'FF_X', 'FF_AVG', 'DDD_X', 'SS']
+        decomposition_data = {
+            "parameters_decomposed": [],
+            "decomposition_data": {}
+        }
+        
+        for param in params:
+            if param not in df.columns:
+                continue
+        
+            # Check minimum data requirement (+2 years)
+            if len(df)< 730:
+                logger.warning(f"{param}: Insufficient data for STL decomposition ({len(df)} days < 730)")
+                continue
+        
+            try:
+                series = df[param].dropna()
+                if len(series) < 730:
+                    logger.warning(f"{param}: Insufficient valid data after dropping NaN ({len(series)} < 730)")
+                    continue
+            
+                logger.info(f"Decomposing {param} using STL")
+                
+                # STL decomposition with Indonesian seasonal patterns
+                stl = STL(series, period=365, robust=True, seasonal=13)  # 13 for seasonal smoothing
+                result = stl.fit()
+                
+                # Extract components
+                trend = result.trend.dropna()
+                seasonal = result.seasonal.dropna()
+                residual = result.resid.dropna()
+                
+                # Calculate Indonesian wet/dry season statistics
+                wet_months = [9, 10, 11, 12, 1, 2, 3]  # Sep-Mar
+                dry_months = [4, 5, 6, 7, 8]            # Apr-Aug
+                
+                # Seasonal analysis by Indonesian patterns
+                wet_seasonal = seasonal[seasonal.index.month.isin(wet_months)]
+                dry_seasonal = seasonal[seasonal.index.month.isin(dry_months)]
+                
+                seasonal_stats = {
+                    "wet_season_avg": float(wet_seasonal.mean()) if len(wet_seasonal) > 0 else 0.0,
+                    "dry_season_avg": float(dry_seasonal.mean()) if len(dry_seasonal) > 0 else 0.0,
+                    "seasonal_amplitude": float(seasonal.max() - seasonal.min()),
+                    "wet_dry_difference": float(wet_seasonal.mean() - dry_seasonal.mean()) if len(wet_seasonal) > 0 and len(dry_seasonal) > 0 else 0.0
+                }
+                
+                # Calculate decomposition statistics
+                decomp_stats = {
+                    "trend_strength": self._calculate_trend_strength(series, result.trend, result.resid),  # ← FIX: Pass residual
+                    "seasonal_strength": self._calculate_seasonal_strength(series, seasonal, result.resid),  # Also use actual residual
+                    "data_points": len(series),
+                    "trend_direction": "increasing" if trend.iloc[-1] > trend.iloc[0] else "decreasing",
+                    "seasonal_stats": seasonal_stats
+                }
+                
+                # Store components (sample for embedding)
+                components_sample = {
+                    "trend": trend.tail(90).to_dict(),      # Last 3 months
+                    "seasonal": seasonal.tail(90).to_dict(), # Last 3 months  
+                    "residual": residual.tail(90).to_dict()  # Last 3 months
+                }
+                
+                decomposition_data["decomposition_data"][param] = {
+                    "method": "STL_robust",
+                    "period": 365,
+                    "statistics": decomp_stats,
+                    "components_sample": components_sample,
+                    "seasonal_analysis": seasonal_stats
+                }
+                
+                decomposition_data["parameters_decomposed"].append(param)
+                
+                logger.info(f"{param}: STL decomposition completed (trend_strength={decomp_stats['trend_strength']:.3f}, seasonal_strength={decomp_stats['seasonal_strength']:.3f})")
+
+            except Exception as e:
+                logger.error(f"Error decomposing {param}: {str(e)}")
+                decomposition_data["decomposition_data"][param] = {
+                    "error": str(e),
+                    "status": "failed"
+                }
+        # Store in preprocessing report
+        self.preprocessing_report["decomposition"] = decomposition_data
+    
+        success_count = len(decomposition_data["parameters_decomposed"])
+        logger.info(f"STL decomposition completed: {success_count}/{len(params)} parameters successfully decomposed")
+        
+    def _calculate_trend_strength(self, series: pd.Series, trend: pd.Series, residual: pd.Series) -> float:
+        """
+        Calculate trend strength for STL decomposition
+        
+        FIXED: Use actual residual from STL result instead of (series - trend)
+        
+        Formula: trend_strength = 1 - var(residual) / var(detrended)
+        where detrended = series - trend (contains seasonal + residual)
+        """
+        try:
+            # Calculate detrended series (contains seasonal + residual components)
+            detrended = (series - trend).dropna()
+            
+            # Use actual residual from STL decomposition (NOT series - trend)
+            actual_residual = residual.dropna()
+            
+            # Ensure same length by aligning indices
+            common_idx = detrended.index.intersection(actual_residual.index)
+            if len(common_idx) < 10:  # Need minimum data points
+                return 0.0
+            
+            detrended_aligned = detrended.loc[common_idx]
+            residual_aligned = actual_residual.loc[common_idx]
+            
+            # Calculate variances
+            var_detrended = np.var(detrended_aligned)
+            var_residual = np.var(residual_aligned)
+            
+            if var_detrended > 0:
+                trend_strength = max(0, 1 - (var_residual / var_detrended))
+                
+                # Debug logging for verification
+                logger.debug(f"Trend strength calc: var_detrended={var_detrended:.4f}, var_residual={var_residual:.4f}, strength={trend_strength:.4f}")
+                
+                return trend_strength
+            return 0.0
+            
+        except Exception as e:
+            logger.warning(f"Error calculating trend strength: {str(e)}")
+            return 0.0
+    
+    def _calculate_seasonal_strength(
+        self,
+        series: pd.Series,
+        seasonal: pd.Series,
+        residual: pd.Series
+    )-> float:
+        """Calculate seasonal strength for STL decomposition"""
+        try:
+            var_seasonal = np.var(seasonal.dropna())
+            var_residual = np.var(residual.dropna())
+            
+            if (var_seasonal + var_residual) > 0:
+                return var_seasonal / (var_seasonal + var_residual)
+            return 0.0
+        except:
+            return 0.0
     
     def _calculate_trend_penalty(self, trend_preservation_pct: float) -> float:
         """
@@ -3590,17 +3787,21 @@ class BmkgPreprocessor:
         smoothing_quality: Dict[str, Any],
         missing_ratio: float,
         param: str
-    )-> Dict[str,  Any]:
+    ) -> Dict[str, Any]:
         """
-        Calculate Holt-Winters model coverage with framework
+        Calculate Holt-Winters model coverage with enhanced penalties
+        
+        FIXED: 
+        1. Missing data penalty uses ORIGINAL ratio
+        2. Added debug logging for penalty breakdown
         
         Penalties:
         1. GCV Smoothing Quality (0-15%)
         2. Trend Preservation (0-15%)
         3. Seasonality Loss (0-20%)
         4. Non-stationarity (0-15%)
-        5. Large Gaps (0-15%)
-        6. Missing Data (0-25%)
+        5. Large Gaps (0-12%, enhanced)
+        6. Missing Data - ORIGINAL ratio (0-5%)
         7. Compound Issues (0-15%)
         """
         
@@ -3636,21 +3837,21 @@ class BmkgPreprocessor:
             base_coverage -= stationarity_penalty
             uncovered_reasons["non_stationarity"] = round(stationarity_penalty, 2)
         
-        # PENALTY 5: Large Gaps
-        gap_penalty = gaps.get("impact_percentage", 0)
+        # PENALTY 5: Large Gaps (enhanced)
+        gap_penalty = self._calculate_enhanced_gap_penalty(gaps, param)
         
         if gap_penalty > 0:
             base_coverage -= gap_penalty
             uncovered_reasons["large_gaps"] = round(gap_penalty, 2)
         
-        # PENALTY 6: Missing Data
-        missing_penalty = missing_ratio * 25
+        # PENALTY 6: Missing Data - FIXED to use ORIGINAL ratio
+        original_missing_penalty = self._calculate_original_missing_penalty(param)
         
-        if missing_penalty > 0:
-            base_coverage -= missing_penalty
-            uncovered_reasons["missing_data"] = round(missing_penalty, 2)
+        if original_missing_penalty > 0:
+            base_coverage -= original_missing_penalty
+            uncovered_reasons["original_missing_data"] = round(original_missing_penalty, 2)
         
-        # PENALTY 7: Compound Penalty (if multiple serious issues)
+        # PENALTY 7: Compound Penalty
         issue_count = 0
         
         if gap_penalty > 5:
@@ -3669,17 +3870,28 @@ class BmkgPreprocessor:
             base_coverage -= compound_penalty
             uncovered_reasons["compound_issues"] = round(compound_penalty, 2)
             
-            logger.warning(
-                f"{param}: {issue_count} serious issues for HW - "
-            ) 
+            logger.warning(f"{param}: {issue_count} serious issues for HW")
         
         # Final coverage
-        final_coverage  = max(0, base_coverage)
+        final_coverage = max(0, base_coverage)
+        
+        # DEBUG LOGGING
+        logger.debug(f"HW {param} penalty breakdown:")
+        logger.debug(f"  GCV: {gcv_penalty:.2f}%")
+        logger.debug(f"  Trend: {trend_penalty:.2f}%")
+        logger.debug(f"  Seasonality: {seasonality_penalty:.2f}%")
+        logger.debug(f"  Stationarity: {stationarity_penalty:.2f}%")
+        logger.debug(f"  Gap (enhanced): {gap_penalty:.2f}%")
+        logger.debug(f"  Original Missing: {original_missing_penalty:.2f}%")
+        logger.debug(f"  Compound: {uncovered_reasons.get('compound_issues', 0):.2f}%")
+        logger.debug(f"  TOTAL PENALTY: {100 - final_coverage:.2f}%")
+        logger.debug(f"  FINAL COVERAGE: {final_coverage:.2f}%")
+        
         return {
             "coverage_percentage": round(final_coverage, 2),
             "uncovered_reasons": uncovered_reasons
         }
-    
+        
     def _calculate_lstm_coverage(
         self,
         gaps: Dict[str, Any],
@@ -3688,52 +3900,46 @@ class BmkgPreprocessor:
         smoothing_quality: Dict[str, Any],
         missing_ratio: float,
         param: str
-    )-> Dict[str, Any]:
+    ) -> Dict[str, Any]:
         """
         Calculate LSTM model coverage with refined penalties
         
-         Key Differences from Holt-Winters:
-        1. 80% weight for GCV smoothing (LSTM more tolerant of artifacts)
-        2. 80% weight for trend preservation (LSTM learns non-linear trends)
-        3. 80% weight for large gaps (LSTM handles gaps via sequential learning)
-        4. NO seasonality penalty (LSTM learns seasonality automatically)
-        5. NO stationarity penalty (LSTM doesn't require stationarity)
+        FIXED BUGS:
+        1. Missing data penalty now uses ORIGINAL missing ratio
+        2. Added imputation quality penalty (method-based weighting)
+        3. Added debug logging for penalty breakdown
         
         Penalties:
-        1. GCV Smoothing Quality (0-12%, 80% weight)
-        2. Trend Preservation (0-12%, 80% weight)
-        3. Large Gaps (0-12%, 80% weight)
+        1. GCV Smoothing Quality (0-15%)
+        2. Trend Preservation (0-15%)
+        3. Large Gaps (0-12%)
         4. Extreme Outliers (0-10%)
         5. Precipitation Extremes (0-10%, RR only)
-        6. Missing Data (0-25%)
-        7. Compound Issues (0-15%)
+        6. Missing Data - ORIGINAL ratio (0-5%)
+        7. Imputation Quality (0-15%, NEW)
+        8. Compound Issues (0-15%)
         """
         
         base_coverage = 100.0
         uncovered_reasons = {}
         
-        # PENALTY 1: GCV Smoothing Quality (80% weight vs HW)
-        gcv_penalty_full = smoothing_quality.get("penalty", 0)
-        gcv_penalty = gcv_penalty_full * 0.8  # 80% weight
+        # PENALTY 1: GCV Smoothing Quality
+        gcv_penalty = smoothing_quality.get("penalty", 0)
         
         if gcv_penalty > 0:
             base_coverage -= gcv_penalty
             uncovered_reasons["smoothing_quality"] = round(gcv_penalty, 2)
         
-        # PENALTY 2: Trend Preservation (80% weight)
+        # PENALTY 2: Trend Preservation
         trend_value = smoothing_quality.get("trend_value", 100)
+        trend_penalty = self._calculate_trend_penalty(trend_value)
         
-        if trend_value > 0:  # Only if smoothing was applied
-            trend_penalty_full = self._calculate_trend_penalty(trend_value)
-            trend_penalty = trend_penalty_full * 0.8  # 80% weight for LSTM
-            
-            if trend_penalty > 0:
-                base_coverage -= trend_penalty
-                uncovered_reasons["trend_preservation_loss"] = round(trend_penalty, 2)
+        if trend_penalty > 0:
+            base_coverage -= trend_penalty
+            uncovered_reasons["trend_preservation_loss"] = round(trend_penalty, 2)
         
-        # PENALTY 3: Large Gaps (80% weight vs HW)
-        gap_penalty_full = gaps.get("impact_percentage", 0)
-        gap_penalty = gap_penalty_full * 0.8  # 80% weight
+        # PENALTY 3: Large Gaps (enhanced with unfilled gap detection)
+        gap_penalty = self._calculate_enhanced_gap_penalty(gaps, param)
         
         if gap_penalty > 0:
             base_coverage -= gap_penalty
@@ -3757,26 +3963,34 @@ class BmkgPreprocessor:
                 base_coverage -= precip_penalty
                 uncovered_reasons["precipitation_extremes"] = round(precip_penalty, 2)
         
-        # PENALTY 6: Missing Data
-        missing_penalty = missing_ratio * 25
+        # PENALTY 6: Missing Data - FIXED to use ORIGINAL ratio
+        original_missing_penalty = self._calculate_original_missing_penalty(param)
         
-        if missing_penalty > 0:
-            base_coverage -= missing_penalty
-            uncovered_reasons["missing_data"] = round(missing_penalty, 2)
+        if original_missing_penalty > 0:
+            base_coverage -= original_missing_penalty
+            uncovered_reasons["original_missing_data"] = round(original_missing_penalty, 2)
         
-        # PENALTY 7: Compound Penalty (if multiple serious issues)
+        # PENALTY 7: Imputation Quality - NEW
+        imputation_quality_penalty = self._calculate_imputation_quality_penalty(param)
+        
+        if imputation_quality_penalty > 0:
+            base_coverage -= imputation_quality_penalty
+            uncovered_reasons["imputation_quality"] = round(imputation_quality_penalty, 2)
+        
+        # PENALTY 8: Compound Penalty
         issue_count = 0
         
-        # Slightly lower thresholds than HW (80% Factor)
-        if gap_penalty > 4:  # 80% of 5
+        if gap_penalty > 5:
             issue_count += 1
         if outlier_penalty > 3:
             issue_count += 1
         if precip_penalty > 5:
             issue_count += 1
-        if gcv_penalty > 8:  # 80% of 10
+        if gcv_penalty > 10:
             issue_count += 1
-        if trend_penalty >= 10:  # 80% of 12
+        if trend_penalty >= 12:
+            issue_count += 1
+        if imputation_quality_penalty > 5:
             issue_count += 1
         
         if issue_count >= 3:
@@ -3784,18 +3998,313 @@ class BmkgPreprocessor:
             base_coverage -= compound_penalty
             uncovered_reasons["compound_issues"] = round(compound_penalty, 2)
             
-            logger.warning(
-                f"{param}: {issue_count} serious issues for LSTM - "
-                f"Compound penalty applied (forecasting uncertain)"
-            )
+            logger.warning(f"{param}: {issue_count} serious issues for LSTM")
         
-        # FINAL COVERAGE
+        # Final coverage
         final_coverage = max(0, base_coverage)
+        
+        # DEBUG LOGGING
+        logger.debug(f"LSTM {param} penalty breakdown:")
+        logger.debug(f"  GCV: {gcv_penalty:.2f}%")
+        logger.debug(f"  Trend: {trend_penalty:.2f}%")
+        logger.debug(f"  Gap (enhanced): {gap_penalty:.2f}%")
+        logger.debug(f"  Outliers: {outlier_penalty:.2f}%")
+        logger.debug(f"  Precipitation: {precip_penalty:.2f}%")
+        logger.debug(f"  Original Missing: {original_missing_penalty:.2f}%")
+        logger.debug(f"  Imputation Quality: {imputation_quality_penalty:.2f}%")
+        logger.debug(f"  Compound: {uncovered_reasons.get('compound_issues', 0):.2f}%")
+        logger.debug(f"  TOTAL PENALTY: {100 - final_coverage:.2f}%")
+        logger.debug(f"  FINAL COVERAGE: {final_coverage:.2f}%")
         
         return {
             "coverage_percentage": round(final_coverage, 2),
             "uncovered_reasons": uncovered_reasons
         }
+    
+    def _calculate_original_missing_penalty(self, param: str) -> float:
+        """
+        Calculate penalty based on ORIGINAL missing data ratio (before imputation)
+        
+        CRITICAL FIX: Uses original missing count from imputation report,
+        NOT post-imputation missing ratio which is always 0.
+        
+        Args:
+            param: Parameter name
+        
+        Returns:
+            Penalty percentage (0-5%)
+        """
+        try:
+            # Get original missing count from imputation report
+            imputation_stats = self.preprocessing_report.get("imputation", {})
+            
+            if param not in imputation_stats:
+                # No imputation performed = no missing data
+                return 0.0
+            
+            param_stats = imputation_stats[param]
+            original_missing = param_stats.get("before", 0)
+            
+            # Get total records
+            if self.original_data is not None:
+                total_records = len(self.original_data)
+            else:
+                # Fallback to current dataset length
+                total_records = 7565  # Default BMKG dataset size
+            
+            # Calculate original missing ratio
+            if total_records > 0:
+                original_missing_ratio = original_missing / total_records
+            else:
+                original_missing_ratio = 0.0
+            
+            # Apply penalty (max 5% for missing data)
+            # 0-5% missing → 0-1% penalty
+            # 5-20% missing → 1-3% penalty
+            # >20% missing → 3-5% penalty
+            if original_missing_ratio <= 0.05:
+                penalty = original_missing_ratio * 20  # 0-1%
+            elif original_missing_ratio <= 0.20:
+                penalty = 1.0 + (original_missing_ratio - 0.05) * 13.33  # 1-3%
+            else:
+                penalty = 3.0 + min((original_missing_ratio - 0.20) * 10, 2.0)  # 3-5%
+            
+            logger.debug(
+                f"{param}: Original missing = {original_missing}/{total_records} "
+                f"({original_missing_ratio*100:.1f}%) → penalty = {penalty:.2f}%"
+            )
+            
+            return round(penalty, 2)
+            
+        except Exception as e:
+            logger.warning(f"Error calculating original missing penalty for {param}: {str(e)}")
+            return 0.0
+    
+    def _calculate_imputation_quality_penalty(self, param: str) -> float:
+        """
+        Calculate penalty based on imputation method quality and confidence
+        
+        NEW FEATURE: Penalizes low-confidence imputation methods
+        
+        Quality tiers:
+        - Calculation/Interpolate (physics-based, short gaps): Low penalty
+        - Two-stage/Ratio (algorithmic): Medium penalty
+        - Statistical fallback (circular mean, mode): High penalty
+        
+        Args:
+            param: Parameter name
+        
+        Returns:
+            Penalty percentage (0-15%)
+        """
+        try:
+            # Get imputation stats
+            imputation_stats = self.preprocessing_report.get("imputation", {})
+            
+            if param not in imputation_stats:
+                # No imputation = no penalty
+                return 0.0
+            
+            param_stats = imputation_stats[param]
+            imputed_count = param_stats.get("imputed", 0)
+            method = param_stats.get("method", "")
+            
+            # Get total records
+            if self.original_data is not None:
+                total_records = len(self.original_data)
+            else:
+                total_records = 7565
+            
+            if total_records == 0 or imputed_count == 0:
+                return 0.0
+            
+            # Calculate imputation ratio
+            imputation_ratio = imputed_count / total_records
+            
+            # Determine quality multiplier based on method
+            # Lower multiplier = higher confidence = lower penalty
+            method_lower = method.lower()
+            
+            if "calculation" in method_lower or "mathematical" in method_lower:
+                # Physics-based calculations (TX from TAVG/TN)
+                quality_multiplier = 0.2
+                quality_tier = "high_confidence"
+                
+            elif "interpolate" in method_lower or "spline" in method_lower or "cubic" in method_lower:
+                # Interpolation for short gaps
+                quality_multiplier = 0.3
+                quality_tier = "high_confidence"
+                
+            elif "ratio" in method_lower and "gap_aware" in method_lower:
+                # FF_AVG from FF_X ratio (gap-aware)
+                quality_multiplier = 0.4
+                quality_tier = "medium_confidence"
+                
+            elif "two_stage" in method_lower or "two_tier" in method_lower or "binary" in method_lower:
+                # RR two-stage imputation
+                quality_multiplier = 0.5
+                quality_tier = "medium_confidence"
+                
+            elif "dewpoint" in method_lower:
+                # RH_AVG from dewpoint
+                quality_multiplier = 0.4
+                quality_tier = "medium_confidence"
+                
+            elif "circular" in method_lower or "circular_mean" in method_lower:
+                # DDD_X circular mean (statistical fallback)
+                quality_multiplier = 0.7
+                quality_tier = "low_confidence"
+                
+            elif "mode" in method_lower:
+                # DDD_CAR mode (categorical fallback)
+                quality_multiplier = 0.8
+                quality_tier = "low_confidence"
+                
+            else:
+                # Unknown method - moderate penalty
+                quality_multiplier = 0.5
+                quality_tier = "medium_confidence"
+            
+            # Calculate penalty
+            # penalty = imputation_ratio * quality_multiplier * max_penalty
+            max_penalty = 15.0
+            penalty = imputation_ratio * quality_multiplier * max_penalty
+            
+            # Cap at max_penalty
+            penalty = min(penalty, max_penalty)
+            
+            logger.debug(
+                f"{param}: Imputation quality penalty calculation:"
+            )
+            logger.debug(f"  Method: {method} → tier: {quality_tier} (multiplier: {quality_multiplier})")
+            logger.debug(f"  Imputed: {imputed_count}/{total_records} ({imputation_ratio*100:.1f}%)")
+            logger.debug(f"  Penalty: {penalty:.2f}%")
+            
+            return round(penalty, 2)
+            
+        except Exception as e:
+            logger.warning(f"Error calculating imputation quality penalty for {param}: {str(e)}")
+            return 0.0
+        
+    def _calculate_enhanced_gap_penalty(self, gaps: Dict[str, Any], param: str) -> float:
+        """
+        Calculate enhanced gap penalty considering gap size and unfilled gaps
+        
+        ENHANCEMENT: Also checks for unfilled gaps from gap-aware imputation
+        
+        Args:
+            gaps: Gap analysis results
+            param: Parameter name
+        
+        Returns:
+            Penalty percentage (0-12%)
+        """
+        try:
+            penalty = 0.0
+            
+            # COMPONENT 1: Standard gap penalty from detection
+            gap_impact = gaps.get("impact_percentage", 0)
+            penalty += gap_impact
+            
+            # COMPONENT 2: Unfilled gaps penalty (gap-aware parameters only)
+            gap_aware_params = ["FF_X", "FF_AVG", "DDD_X", "DDD_CAR"]
+            
+            if param in gap_aware_params:
+                imputation_stats = self.preprocessing_report.get("imputation", {})
+                
+                if param in imputation_stats:
+                    param_stats = imputation_stats[param]
+                    
+                    # Check for remaining missing values
+                    remaining_missing = param_stats.get("remaining_missing", 0)
+                    
+                    if remaining_missing > 0:
+                        # Get total records
+                        if self.original_data is not None:
+                            total_records = len(self.original_data)
+                        else:
+                            total_records = 7565
+                        
+                        # Calculate unfilled ratio
+                        unfilled_ratio = remaining_missing / total_records
+                        
+                        # Unfilled gaps penalty: 0.5 weight (moderate impact)
+                        # These are INTENTIONALLY unfilled (long gaps), not failures
+                        unfilled_penalty = unfilled_ratio * 50  # Max ~5% for 10% unfilled
+                        
+                        penalty += unfilled_penalty
+                        
+                        logger.debug(
+                            f"{param}: Unfilled gaps detected: {remaining_missing} "
+                            f"({unfilled_ratio*100:.1f}%) → penalty: {unfilled_penalty:.2f}%"
+                        )
+            
+            # Cap at maximum
+            penalty = min(penalty, 12.0)
+            
+            return round(penalty, 2)
+            
+        except Exception as e:
+            logger.warning(f"Error calculating enhanced gap penalty for {param}: {str(e)}")
+            return gaps.get("impact_percentage", 0)
+    
+    def _calculate_interpolation_confidence(self, df: pd.DataFrame, param: str) -> float:
+        """
+        Calculate confidence score for interpolated parameters
+        
+        Confidence based on:
+        - Seasonal stability (lower variance = higher confidence)
+        - Gap length (shorter gaps = higher confidence)
+        
+        Returns confidence score (0.0-1.0)
+        """
+        try:
+            # Get parameter statistics
+            param_series = df[param].dropna()
+            
+            if len(param_series) < 30:
+                return 0.5  # Neutral confidence for insufficient data
+            
+            # Factor 1: Seasonal stability
+            monthly_vars = []
+            for month in range(1, 13):
+                month_data = param_series[param_series.index.month == month]
+                if len(month_data) >= 3:
+                    monthly_vars.append(np.var(month_data))
+            
+            if monthly_vars:
+                avg_monthly_var = np.mean(monthly_vars)
+                overall_var = np.var(param_series)
+                
+                # If monthly variance is much lower than overall variance,
+                # parameter is more predictable (higher confidence)
+                if overall_var > 0:
+                    stability_factor = 1 - (avg_monthly_var / overall_var)
+                    stability_factor = max(0, min(1, stability_factor))
+                else:
+                    stability_factor = 0.8
+            else:
+                stability_factor = 0.6
+            
+            # Factor 2: Gap length penalty
+            # Shorter interpolated gaps have higher confidence
+            gaps_report = self.preprocessing_report.get("gaps", {})
+            large_gaps = gaps_report.get("large_gaps", 0)
+            total_gaps = gaps_report.get("total_gaps", 1)
+            
+            if total_gaps > 0:
+                gap_factor = 1 - (large_gaps / total_gaps)
+            else:
+                gap_factor = 1.0
+            
+            # Combine factors
+            confidence = (stability_factor * 0.7) + (gap_factor * 0.3)
+            return max(0.3, min(1.0, confidence))  # Clip to reasonable range
+            
+        except Exception as e:
+            logger.debug(f"Error calculating confidence for {param}: {str(e)}")
+            return 0.6  # Default moderate confidence
+        
     def _aggregate_uncovered_breakdown(
         self,
         per_parameter_results: Dict[str, Any],
@@ -3972,3 +4481,88 @@ class BmkgPreprocessor:
         logger.info(f"Critical parameters: {critical_params_str}")
         metadata_params_str = [f'{k}={v["coverage_pct"]:.1f}%' for k, v in metadata_status.items()]
         logger.info(f"Metadata parameters: {metadata_params_str}")
+        
+    def _save_preprocessing_report(
+        self, 
+        cleaned_collection_name: str
+    )->  Dict[str, Any]:
+        """
+        Save unified preprocessing report to MongoDB preprocessing_report collection
+        Compatible with NASA structure for unified frontend consumption
+        """
+        
+        try:
+            # Generate report metadata
+            report_metadata = {
+                "dataset_type": "bmkg",
+                "collection_name": self.collection_name,
+                "cleaned_collection_name": cleaned_collection_name,
+                "created_at": datetime.now(),
+                "processing_time": None,  # Will be calculated in preprocess()
+                "total_parameters": len(self.params_to_process),
+                "parameters_processed": list(self.preprocessing_report.get("imputation", {}).keys())
+            }
+            
+            # Combine report with metadata
+            unified_report = {
+                **report_metadata,
+                "preprocessing_details": self.preprocessing_report
+            }
+            
+            # Sanitize for MongoDB
+            sanitized_report = self._sanitize_for_mongodb(unified_report)
+            
+            # Save to preprocessing_report collection
+            result = self.db["preprocessing_report"].insert_one(sanitized_report)
+            
+            logger.info(f"Saved unified preprocessing report with ID: {result.inserted_id}")
+            
+            return {
+                "status": "success",
+                "report_id": str(result.inserted_id),
+                "collection": "preprocessing_report"
+            }
+        except Exception as e:
+            logger.error(f"Error saving preprocessing report: {str(e)}")
+            return {
+                "status": "error",
+                "error": str(e)
+            }
+            
+    def _sanitize_for_mongodb(self, obj):
+        """
+        Recursively convert numpy types to native Python types for MongoDB serialization
+        (Same implementation as NASA preprocessing)
+        """
+        if isinstance(obj, dict):
+            sanitized_dict = {}
+            for key, value in obj.items():
+                # Convert pandas Timestamp keys to strings
+                if isinstance(key, pd.Timestamp):
+                    str_key = key.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    str_key = str(key) if not isinstance(key, str) else key
+                sanitized_dict[str_key] = self._sanitize_for_mongodb(value)
+            return sanitized_dict
+        elif isinstance(obj, list):
+            return [self._sanitize_for_mongodb(item) for item in obj]
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, pd.DataFrame):
+            return obj.to_dict('records')
+        elif isinstance(obj, pd.Series):
+            return obj.to_dict()  # also convert timestamp keys
+        elif isinstance(obj, pd.Index):
+            return obj.tolist()
+        elif isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+        elif hasattr(obj, 'item'):
+            return obj.item()
+        else:
+            return obj

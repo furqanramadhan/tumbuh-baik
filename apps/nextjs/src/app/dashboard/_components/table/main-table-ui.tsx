@@ -56,9 +56,7 @@ interface DataTableProps<TData, TValue> {
   };
   preprocessing?: {
     collectionName: string;
-    isNasaDataset: boolean;
-    isBmkgDataset: boolean;
-    isAPI?: boolean;
+    isAPI: boolean; 
     onPreprocessingComplete?: () => void;
   };
   isLoading?: boolean;
@@ -83,12 +81,11 @@ export function MainTableUI<TData, TValue>({
     useState(false);
 
   const canPreprocess =
-    preprocessing?.isNasaDataset || preprocessing?.isBmkgDataset;
+    preprocessing?.isAPI !== undefined;
 
   const getPreprocessingButtonText = () => {
-    if (preprocessing?.isNasaDataset) return "Preprocess NASA";
-    if (preprocessing?.isBmkgDataset) return "Preprocess BMKG";
-    return "Preprocess";
+    if (!preprocessing) return "Preprocess";
+    return preprocessing.isAPI ? "Preprocess NASA" : "Preprocess BMKG";
   };
 
   const table = useReactTable({
@@ -336,9 +333,7 @@ export function MainTableUI<TData, TValue>({
       {canPreprocess && (
         <PreprocessingModal
           collectionName={preprocessing.collectionName}
-          isNasaDataset={preprocessing.isNasaDataset}
-          isBmkgDataset={preprocessing.isBmkgDataset}
-          isAPI={preprocessing.isAPI}
+          isAPI={preprocessing.isAPI}  // Only pass isAPI
           isOpen={isPreprocessingModalOpen}
           onClose={() => setIsPreprocessingModalOpen(false)}
           onSuccess={handlePreprocessingSuccess}

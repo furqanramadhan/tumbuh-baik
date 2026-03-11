@@ -57,7 +57,8 @@ export default function EditDatasetDialog({
     message: "",
     isLoading: false,
   });
-  // Form state
+
+  // Form state - initialize with dataset values
   const [form, setForm] = useState({
     name: dataset?.name || "",
     source: dataset?.source || "",
@@ -65,12 +66,26 @@ export default function EditDatasetDialog({
     description: dataset?.description || "",
     status: dataset?.status || "raw",
   });
+
+  // Reset form when dialog opens or dataset changes
+  useEffect(() => {
+    if (open && dataset) {
+      setForm({
+        name: dataset.name || "",
+        source: dataset.source || "",
+        collectionName: dataset.collectionName || "",
+        description: dataset.description || "",
+        status: dataset.status || "raw",
+      });
+    }
+  }, [open, dataset]);
+
   // useEffect for NASA latest date
   useEffect(() => {
     if (open && dataset.isAPI && dataset.apiConfig?.type === "nasa-power") {
       setRefreshStatus((prev) => ({ ...prev, isLoading: true }));
 
-      getDatasetRefreshStatus(dataset._id, true) // Pass isAPI = true for NASA datasets
+      getDatasetRefreshStatus(dataset._id, true)
         .then((status) => {
           setRefreshStatus({
             canRefresh: status.canRefresh,
@@ -82,7 +97,6 @@ export default function EditDatasetDialog({
         })
         .catch((error) => {
           console.error("Error fetching refresh status:", error);
-          // On error, allow refresh attempt
           setRefreshStatus({
             canRefresh: true,
             daysSinceLastRecord: 0,
@@ -94,37 +108,102 @@ export default function EditDatasetDialog({
     }
   }, [open, dataset._id, dataset.isAPI, dataset.apiConfig?.type]);
 
-  // Mutation update
+  // Mutation update - FIXED VERSION
   const { mutate: updateDataset, isPending: isPending } = useMutation({
     mutationKey: ["update-dataset", dataset._id],
-    mutationFn: (data: typeof form) => {
+    mutationFn: async (data: typeof form) => {
       if (!dataset?._id) {
+        console.error("❌ Dataset ID is missing!");
         throw new Error("Dataset ID is missing");
       }
 
-      // only includes status if it changed from original
-      const updatePayload = {
-        name: data.name,
-        source: data.source,
-        collectionName: data.collectionName,
-        description: data.description,
-        ...(data.status !== dataset.status && { status: data.status }), // ← Only send if changed
+      // Validate required fields
+      if (!data.name?.trim()) {
+        throw new Error("Nama dataset tidak boleh kosong");
+      }
+      if (!data.source?.trim()) {
+        throw new Error("Sumber data tidak boleh kosong");
+      }
+
+      // Build update payload - send all editable fields
+      const updatePayload: {
+        name: string;
+        source: string;
+        collectionName: string;
+        description: string;
+        status?: string;
+      } = {
+        name: data.name.trim(),
+        source: data.source.trim(),
+        collectionName: data.collectionName.trim(),
+        description: data.description?.trim() || "",
       };
 
-      return UpdateDatasetMeta(dataset._id, updatePayload);
+      // Include status if it changed
+      if (data.status && data.status !== dataset.status) {
+        updatePayload.status = data.status;
+      }
+
+      console.log("📤 Update Dataset Request:");
+      console.log("   Dataset ID:", dataset._id);
+      console.log("   Payload:", updatePayload);
+
+      try {
+        const result = await UpdateDatasetMeta(dataset._id, updatePayload);
+        console.log("✅ Update successful, result:", result);
+        return result;
+      } catch (error: any) {
+        console.error("❌ UpdateDatasetMeta error:", error);
+        console.error("   Response:", error?.response?.data);
+        console.error("   Status:", error?.response?.status);
+        throw error;
+      }
     },
     onSuccess: (result) => {
-      toast.success("Dataset berhasil diperbarui");
+      console.log("✅ Update mutation succeeded:", result);
+      
+      toast.success("Dataset berhasil diperbarui", {
+        duration: 3000,
+        position: "bottom-right",
+      });
+
+      // Invalidate queries to refresh data
       queryClient.invalidateQueries({ queryKey: ["datasets"] });
+      queryClient.invalidateQueries({ queryKey: ["dataset", dataset._id] });
+
+      // Close modals
       setOpen(false);
       setIsUpdateConfirmOpen(false);
     },
     onError: (error: any) => {
-      console.error("❌ Update failed, error:", error);
-      console.error("❌ Error response:", error.response?.data);
-      const errorMessage =
-        error?.response?.data?.message || "Gagal memperbarui dataset";
-      toast.error(errorMessage);
+      console.error("❌ Update mutation failed");
+      console.error("   Error object:", error);
+      console.error("   Response data:", error?.response?.data);
+      console.error("   Status code:", error?.response?.status);
+
+      // Extract error message with multiple fallbacks
+      let errorMessage = "Gagal memperbarui dataset";
+
+      if (error?.response?.data?.message) {
+        errorMessage = error.response.data.message;
+      } else if (error?.response?.data?.error) {
+        errorMessage = error.response.data.error;
+      } else if (error?.response?.data?.detail) {
+        errorMessage = error.response.data.detail;
+      } else if (error?.message) {
+        errorMessage = error.message;
+      }
+
+      // Add HTTP status code for debugging
+      if (error?.response?.status) {
+        errorMessage = `[${error.response.status}] ${errorMessage}`;
+      }
+
+      toast.error(errorMessage, {
+        duration: 5000,
+        position: "bottom-right",
+      });
+
       setIsUpdateConfirmOpen(false);
     },
   });
@@ -179,7 +258,6 @@ export default function EditDatasetDialog({
       });
 
       queryClient.invalidateQueries({ queryKey: ["datasets"] });
-      // Don't close dialog, let user see the result
     },
     onError: (error: any) => {
       console.error("❌ Refresh failed, error:", error);
@@ -200,7 +278,6 @@ export default function EditDatasetDialog({
           },
         );
 
-        // Update refresh status
         setRefreshStatus({
           canRefresh: false,
           daysSinceLastRecord: 0,
@@ -217,9 +294,8 @@ export default function EditDatasetDialog({
     },
   });
 
-  // funtion handle refresh
+  // Function handle refresh
   const handleRefreshClick = () => {
-    // Prevent refresh if status check is still loading
     if (refreshStatus.isLoading) {
       toast("Memeriksa status data...", {
         icon: "ℹ️",
@@ -228,7 +304,6 @@ export default function EditDatasetDialog({
       return;
     }
 
-    // Prevent refresh if data is already up-to-date
     if (!refreshStatus.canRefresh) {
       toast(
         `Dataset sudah memiliki data terbaru\nData terakhir: ${new Date(
@@ -248,11 +323,23 @@ export default function EditDatasetDialog({
 
   const handleSubmitClick = (e: React.FormEvent) => {
     e.preventDefault();
-    console.log("Submit button clicked, opening confirmation modal");
+    
+    // Validate form before showing confirmation
+    if (!form.name.trim()) {
+      toast.error("Nama dataset tidak boleh kosong");
+      return;
+    }
+    if (!form.source.trim()) {
+      toast.error("Sumber data tidak boleh kosong");
+      return;
+    }
+
+    console.log("✅ Form validation passed, opening confirmation modal");
     setIsUpdateConfirmOpen(true);
   };
 
   const handleConfirmUpdate = () => {
+    console.log("✅ Update confirmed, calling mutation with form:", form);
     updateDataset(form);
   };
 
@@ -261,25 +348,30 @@ export default function EditDatasetDialog({
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogTrigger asChild>{children}</DialogTrigger>
         <DialogContent className="w-[95vw] max-w-[500px] max-h-[90vh] overflow-y-auto">
-          {" "}
           <DialogHeader>
             <DialogTitle>Edit Dataset</DialogTitle>
             <DialogDescription>Ubah metadata dataset.</DialogDescription>
           </DialogHeader>
+
           {/* Main form */}
           <form onSubmit={handleSubmitClick} className="space-y-4">
             <div className="grid gap-2">
-              <Label htmlFor="name">Nama Dataset</Label>
+              <Label htmlFor="name">
+                Nama Dataset <span className="text-red-500">*</span>
+              </Label>
               <Input
                 id="name"
                 value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
+                placeholder="Masukkan nama dataset"
                 required
               />
             </div>
 
             <div className="grid gap-2">
-              <Label htmlFor="source">Sumber</Label>
+              <Label htmlFor="source">
+                Sumber <span className="text-red-500">*</span>
+              </Label>
               <select
                 id="source"
                 value={form.source}
@@ -305,6 +397,7 @@ export default function EditDatasetDialog({
                 onChange={(e) =>
                   setForm({ ...form, collectionName: e.target.value })
                 }
+                placeholder="Nama koleksi di database"
               />
             </div>
 
@@ -315,9 +408,7 @@ export default function EditDatasetDialog({
                 value={form.status}
                 onChange={(e) => setForm({ ...form, status: e.target.value })}
                 className="border rounded px-3 py-2"
-                //disabled={dataset.isAPI} // Optionally disable for API datasets
               >
-                {/* Show status options based on dataset source/type */}
                 {dataset.isAPI && dataset.apiConfig?.type === "nasa-power" ? (
                   <>
                     <option value="raw">Raw</option>
@@ -345,11 +436,13 @@ export default function EditDatasetDialog({
                 onChange={(e) =>
                   setForm({ ...form, description: e.target.value })
                 }
+                placeholder="Deskripsi dataset (opsional)"
               />
             </div>
+
             {/* Action buttons */}
             <div className="space-y-4 pt-4 border-t">
-              {/* NASA POWER Refresh Section - Pindah ke atas */}
+              {/* NASA POWER Refresh Section */}
               {dataset.isAPI && dataset.apiConfig?.type === "nasa-power" && (
                 <div className="flex flex-col gap-2 p-3 bg-gray-50 rounded-lg border">
                   <div className="text-sm">
@@ -412,7 +505,6 @@ export default function EditDatasetDialog({
 
               {/* Bottom Action Buttons */}
               <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
-                {/* Cancel & Save Buttons - Right */}
                 <div className="flex items-center gap-2 w-full sm:w-auto">
                   <DialogClose asChild>
                     <Button
@@ -425,13 +517,9 @@ export default function EditDatasetDialog({
                     </Button>
                   </DialogClose>
                   <Button
-                    type="button"
+                    type="submit"
                     disabled={isPending}
                     className="flex items-center justify-center gap-2 flex-1 sm:flex-none"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      setIsUpdateConfirmOpen(true);
-                    }}
                     size="sm"
                   >
                     <Icons.save className="h-4 w-4" />

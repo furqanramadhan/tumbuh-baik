@@ -457,7 +457,7 @@ datasetMetaRoute.get("/:slug/chart-data", async (c) => {
 });
 
 // PUT - Update dataset meta by ID or collectionName
-datasetMetaRoute.put("/:idOrSlug", async (c) => {
+datasetMetaRoute.patch("/:idOrSlug", async (c) => {
   try {
     await db();
 

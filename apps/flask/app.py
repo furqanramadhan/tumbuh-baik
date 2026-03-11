@@ -914,30 +914,39 @@ def preprocess_bmkg_stream(collection_name):
         # Setup custom log handler that captures logs
         class SSELogHandler(logging.Handler):
             def emit(self, record):
-                log_entry = self.format(record)
-                
-                # Parse progress information
-                if "PROGRESS:" in log_entry:
-                    try:
-                        # Extract PROGRESS:percentage:stage:message
-                        progress_part = log_entry.split("PROGRESS:")[1]
-                        parts = progress_part.split(":", 2)  # Split into max 3 parts
-                        
-                        if len(parts) >= 3:
-                            # Parse percentage with error handling
-                            try:
-                                percentage_str = parts[0].strip()
-                                percentage = int(percentage_str) if percentage_str.isdigit() else 0
-                            except (ValueError, AttributeError):
-                                percentage = 0
-                                
-                            log_queue.put({
-                                'type': 'progress',
-                                'percentage': percentage,
-                                'stage': parts[1].strip() if len(parts) > 1 else 'processing',
-                                'message': parts[2].strip() if len(parts) > 2 else 'Processing...'
-                            })
-                        else:
+                try:
+                    log_entry = self.format(record)
+                    
+                    # Parse progress information
+                    if "PROGRESS:" in log_entry:
+                        try:
+                            # Extract PROGRESS:percentage:stage:message
+                            progress_part = log_entry.split("PROGRESS:")[1]
+                            parts = progress_part.split(":", 2)  # Split into max 3 parts
+                            
+                            if len(parts) >= 3:
+                                # Parse percentage with error handling
+                                try:
+                                    percentage_str = parts[0].strip()
+                                    percentage = int(percentage_str) if percentage_str.isdigit() else 0
+                                except (ValueError, AttributeError):
+                                    percentage = 0
+                                    
+                                log_queue.put({
+                                    'type': 'progress',
+                                    'percentage': percentage,
+                                    'stage': parts[1].strip() if len(parts) > 1 else 'processing',
+                                    'message': parts[2].strip() if len(parts) > 2 else 'Processing...'
+                                })
+                            else:
+                                # If parsing fails, treat as regular log
+                                log_queue.put({
+                                    'type': 'log',
+                                    'level': record.levelname,
+                                    'message': log_entry,
+                                    'timestamp': time.time()
+                                })
+                        except (ValueError, IndexError) as e:
                             # If parsing fails, treat as regular log
                             log_queue.put({
                                 'type': 'log',
@@ -945,27 +954,21 @@ def preprocess_bmkg_stream(collection_name):
                                 'message': log_entry,
                                 'timestamp': time.time()
                             })
-                    except (ValueError, IndexError) as e:
-                        # If parsing fails, treat as regular log
+                    else:
                         log_queue.put({
                             'type': 'log',
                             'level': record.levelname,
                             'message': log_entry,
                             'timestamp': time.time()
                         })
-                else:
-                    log_queue.put({
-                        'type': 'log',
-                        'level': record.levelname,
-                        'message': log_entry,
-                        'timestamp': time.time()
-                    })
+                except Exception as e:
+                    logger.error(f"SSE Log Handler error: {str(e)}")
         
         # Add handler to preprocessing logger
         sse_handler = SSELogHandler()
         sse_handler.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s'))
         
-        preprocessing_logger = logging.getLogger('preprocessing.bmkg.preprocessing_bmkg')
+        preprocessing_logger = logging.getLogger('preprocessing.bmkg.preprocessing_bmkg_new')
         preprocessing_logger.addHandler(sse_handler)
         preprocessing_logger.setLevel(logging.INFO)
         
@@ -994,17 +997,41 @@ def preprocess_bmkg_stream(collection_name):
                     preprocessor = BmkgPreprocessor(db_instance, collection_name)
                     result = preprocessor.preprocess()
                     
+                    def sanitize_numpy(obj):
+                        if isinstance(obj, dict):
+                            return {key: sanitize_numpy(value) for key, value in obj.items()}
+                        elif isinstance(obj, list):
+                            return [sanitize_numpy(item) for item in obj]
+                        elif hasattr(obj, 'item'):  # numpy scalar
+                            return obj.item()
+                        elif type(obj).__module__ == 'numpy':
+                            if hasattr(obj, 'tolist'):
+                                return obj.tolist()
+                            return obj.item()
+                        else:
+                            return obj
+                    
+                    safe_result = sanitize_numpy(result)
+                    
+                    # Debug detailed logging result 
+                    logger.info(f"Raw preprocessing result: {result}")
+                    logger.info(f"Result keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
+                    
                     # Store result
                     preprocessing_result['status'] = 'success'
-                    preprocessing_result['data'] = result
+                    preprocessing_result['data'] = safe_result
                     
                     # Send completion
                     safe_result = {
                         'recordCount': int(result.get('recordCount', 0)) if result.get('recordCount') else 0,
                         'originalRecordCount': int(result.get('originalRecordCount', 0)) if result.get('originalRecordCount') else 0,
                         'cleanedCollection': result.get('cleanedCollection'),
+                        'collection': result.get('collection'),
+                        'message': result.get('message'),
                         'preprocessing_report': result.get('preprocessing_report')
                     }
+                    
+                    logger.info(f"📤 Sending safe result: {safe_result}")
                     
                     log_queue.put({
                         'type': 'complete',
@@ -1013,6 +1040,9 @@ def preprocess_bmkg_stream(collection_name):
                     })
                     
                 except Exception as e:
+                    logger.error(f"❌ Preprocessing error: {str(e)}")
+                    logger.error(f"❌ Traceback: {traceback.format_exc()}")
+                    
                     preprocessing_result['status'] = 'error'
                     preprocessing_result['error'] = str(e)
                     
@@ -1023,7 +1053,7 @@ def preprocess_bmkg_stream(collection_name):
                     })
                 finally:
                     # Signal completion
-                    logger.info("Preprocessing thread completed, stream will close naturally")
+                    logger.info("🏁 Preprocessing thread completed, stream will close naturally")
                     preprocessing_result['thread_complete'] = True
             
             # Start preprocessing thread
@@ -1037,26 +1067,34 @@ def preprocess_bmkg_stream(collection_name):
                     # Get log from queue (timeout to check if client disconnected)
                     log_data = log_queue.get(timeout=1)
                     
-                    # Check if done
+                    # ✅ FIXED: Send log to client FIRST before checking completion
+                    yield f"data: {json.dumps(log_data)}\n\n"
+                    
+                    # Check if done AFTER sending the message
                     if log_data.get('type') == 'complete':
                         yield f": completion-sent\n\n"
-                        time.sleep(1.0)
-                        logger.info("Closing stream after completion processed")
+                        time.sleep(1.0)  # 1 second delay
+                        logger.info("🎯 Closing stream after completion processed")
                         break
-                    # Send log to client as SSE
-                    yield f"data: {json.dumps(log_data)}\n\n"
                     
                 except Exception:
                     if preprocessing_result.get('thread_complete'):
                         logger.info("🏁 Thread completed, closing stream")
                         break
+                    # Timeout - send keepalive
+                    yield ": keepalive\n\n"
+                    continue
                     
         except GeneratorExit:
             # Client disconnected
             logger.info(f"Client disconnected from preprocessing stream: {collection_name}")
         finally:
             # Cleanup
-            preprocessing_logger.removeHandler(sse_handler)
+            try:
+                preprocessing_logger.removeHandler(sse_handler)
+                logger.info(f"Cleaned up SSE handler for session {session_id}")
+            except Exception as e:
+                logger.error(f"Error during SSE cleanup: {str(e)}")
     
     return Response(
         stream_with_context(generate()),
@@ -1068,6 +1106,8 @@ def preprocess_bmkg_stream(collection_name):
             'Access-Control-Allow-Origin': '*'
         }
     )
+
+
 @app.route('/api/v1/convert/xlsx-to-csv', methods=['POST'])
 def convert_xlsx_to_csv():
     """Convert single XLSX file to CSV format"""
@@ -1158,16 +1198,111 @@ def convert_multi_xlsx_to_csv():
         return jsonify({'error': str(e)}), 500
     
 
+# @preprocessing_bp.route("/dataset-meta/<slug>/decomposition", methods=["GET"])
+# def get_decomposition_data(slug):
+#     """
+#     Get seasonal decomposition data for a specific parameter
+    
+#     Query Parameters:
+#         - parameter: Parameter name (e.g., T2M, RH2M, ALLSKY_SFC_SW_DWN)
+    
+#     Returns:
+#         JSON with decomposition time series (original, trend, seasonal, residual)
+#     """
+#     try:
+#         db = current_app.config['MONGO_DB']
+        
+#         # Get parameter from query string
+#         parameter = request.args.get('parameter')
+#         if not parameter:
+#             return jsonify({"message": "Parameter name is required"}), 400
+        
+#         # Find dataset metadata to get decomposition collection name
+#         meta_collection = "dataset_meta" if "dataset_meta" in db.list_collection_names() else "DatasetMeta"
+        
+#         dataset_meta = db[meta_collection].find_one({"collectionName": slug})
+        
+#         if not dataset_meta:
+#             return jsonify({"message": f"Dataset '{slug}' not found"}), 404
+        
+#         # Check if dataset is preprocessed
+#         if dataset_meta.get("status") != "preprocessed":
+#             return jsonify({
+#                 "message": "Dataset must be preprocessed before viewing decomposition",
+#                 "current_status": dataset_meta.get("status", "unknown")
+#             }), 400
+        
+#         # Get decomposition collection name
+#         decomp_collection_name = f"{slug}_decomposition"
+        
+#         if decomp_collection_name not in db.list_collection_names():
+#             return jsonify({
+#                 "message": "Decomposition data not found. Dataset may need reprocessing.",
+#                 "expected_collection": decomp_collection_name
+#             }), 404
+        
+#         # Query decomposition data for the specific parameter
+#         decomp_data = list(db[decomp_collection_name].find(
+#             {"parameter": parameter},
+#             {"_id": 0}  # Exclude MongoDB _id
+#         ).sort("Date", 1))  # Sort by date ascending
+        
+#         if not decomp_data:
+#             return jsonify({
+#                 "message": f"No decomposition data found for parameter '{parameter}'",
+#                 "available_parameters": db[decomp_collection_name].distinct("parameter")
+#             }), 404
+        
+#         # Extract decomposition components
+#         dates = [record["Date"].isoformat() if isinstance(record["Date"], datetime) else record["Date"] for record in decomp_data]
+#         original = [float(record["original"]) if record["original"] is not None else None for record in decomp_data]
+#         trend = [float(record["trend"]) if record["trend"] is not None else None for record in decomp_data]
+#         seasonal = [float(record["seasonal"]) if record["seasonal"] is not None else None for record in decomp_data]
+#         residual = [float(record["residual"]) if record["residual"] is not None else None for record in decomp_data]
+        
+#         # Prepare response
+#         response = {
+#             "collectionName": slug,
+#             "parameter": parameter,
+#             "decomposition": {
+#                 "dates": dates,
+#                 "original": original,
+#                 "trend": trend,
+#                 "seasonal": seasonal,
+#                 "residual": residual
+#             },
+#             "metadata": {
+#                 "model": "additive",
+#                 "period": 365,
+#                 "dataPoints": len(decomp_data),
+#                 "dateRange": {
+#                     "start": dates[0] if dates else None,
+#                     "end": dates[-1] if dates else None
+#                 }
+#             }
+#         }
+        
+#         return jsonify(response), 200
+        
+#     except Exception as e:
+#         logger.error(f"Error fetching decomposition data: {str(e)}")
+#         logger.error(traceback.format_exc())
+#         return jsonify({"message": f"Server error: {str(e)}"}), 500
+
 @preprocessing_bp.route("/dataset-meta/<slug>/decomposition", methods=["GET"])
 def get_decomposition_data(slug):
     """
-    Get seasonal decomposition data for a specific parameter
+    Get seasonal decomposition data for both NASA and BMKG datasets
     
     Query Parameters:
-        - parameter: Parameter name (e.g., T2M, RH2M, ALLSKY_SFC_SW_DWN)
+        - parameter: Parameter name (e.g., T2M, RH2M for NASA; RR, TX, TN for BMKG)
     
     Returns:
         JSON with decomposition time series (original, trend, seasonal, residual)
+        
+    Supports:
+        - NASA: Separate decomposition collection with full time series
+        - BMKG: Embedded decomposition in preprocessing_report with sample data
     """
     try:
         db = current_app.config['MONGO_DB']
@@ -1177,9 +1312,8 @@ def get_decomposition_data(slug):
         if not parameter:
             return jsonify({"message": "Parameter name is required"}), 400
         
-        # Find dataset metadata to get decomposition collection name
+        # Find dataset metadata to determine dataset type
         meta_collection = "dataset_meta" if "dataset_meta" in db.list_collection_names() else "DatasetMeta"
-        
         dataset_meta = db[meta_collection].find_one({"collectionName": slug})
         
         if not dataset_meta:
@@ -1192,57 +1326,177 @@ def get_decomposition_data(slug):
                 "current_status": dataset_meta.get("status", "unknown")
             }), 400
         
-        # Get decomposition collection name
+        # 🔧 NEW: Determine dataset type from metadata or collection name patterns
+        dataset_type = dataset_meta.get("dataType", "").lower()
+        
+        # Auto-detect if not specified in metadata
+        if not dataset_type:
+            if any(param in ['RR', 'TX', 'TN', 'TAVG', 'RH_AVG', 'FF_X', 'FF_AVG', 'DDD_X', 'SS'] for param in [parameter]):
+                dataset_type = "bmkg"
+            elif any(param in ['T2M', 'RH2M', 'ALLSKY_SFC_SW_DWN', 'WS10M', 'PRECTOTCORR'] for param in [parameter]):
+                dataset_type = "nasa"
+            else:
+                # Try both approaches
+                dataset_type = "auto-detect"
+        
+        # 🎯 APPROACH 1: Try NASA-style separate collection first
         decomp_collection_name = f"{slug}_decomposition"
         
-        if decomp_collection_name not in db.list_collection_names():
-            return jsonify({
-                "message": "Decomposition data not found. Dataset may need reprocessing.",
-                "expected_collection": decomp_collection_name
-            }), 404
-        
-        # Query decomposition data for the specific parameter
-        decomp_data = list(db[decomp_collection_name].find(
-            {"parameter": parameter},
-            {"_id": 0}  # Exclude MongoDB _id
-        ).sort("Date", 1))  # Sort by date ascending
-        
-        if not decomp_data:
-            return jsonify({
-                "message": f"No decomposition data found for parameter '{parameter}'",
-                "available_parameters": db[decomp_collection_name].distinct("parameter")
-            }), 404
-        
-        # Extract decomposition components
-        dates = [record["Date"].isoformat() if isinstance(record["Date"], datetime) else record["Date"] for record in decomp_data]
-        original = [float(record["original"]) if record["original"] is not None else None for record in decomp_data]
-        trend = [float(record["trend"]) if record["trend"] is not None else None for record in decomp_data]
-        seasonal = [float(record["seasonal"]) if record["seasonal"] is not None else None for record in decomp_data]
-        residual = [float(record["residual"]) if record["residual"] is not None else None for record in decomp_data]
-        
-        # Prepare response
-        response = {
-            "collectionName": slug,
-            "parameter": parameter,
-            "decomposition": {
-                "dates": dates,
-                "original": original,
-                "trend": trend,
-                "seasonal": seasonal,
-                "residual": residual
-            },
-            "metadata": {
-                "model": "additive",
-                "period": 365,
-                "dataPoints": len(decomp_data),
-                "dateRange": {
-                    "start": dates[0] if dates else None,
-                    "end": dates[-1] if dates else None
+        if decomp_collection_name in db.list_collection_names():
+            logger.info(f"Found NASA-style decomposition collection: {decomp_collection_name}")
+            
+            # Query decomposition data for the specific parameter
+            decomp_data = list(db[decomp_collection_name].find(
+                {"parameter": parameter},
+                {"_id": 0}  # Exclude MongoDB _id
+            ).sort("Date", 1))  # Sort by date ascending
+            
+            if decomp_data:
+                # Extract decomposition components (NASA format)
+                dates = [record["Date"].isoformat() if isinstance(record["Date"], datetime) else record["Date"] for record in decomp_data]
+                original = [float(record["original"]) if record["original"] is not None else None for record in decomp_data]
+                trend = [float(record["trend"]) if record["trend"] is not None else None for record in decomp_data]
+                seasonal = [float(record["seasonal"]) if record["seasonal"] is not None else None for record in decomp_data]
+                residual = [float(record["residual"]) if record["residual"] is not None else None for record in decomp_data]
+                
+                # Prepare NASA-style response
+                response = {
+                    "collectionName": slug,
+                    "parameter": parameter,
+                    "dataset_type": "nasa",
+                    "data_source": "separate_collection",
+                    "decomposition": {
+                        "dates": dates,
+                        "original": original,
+                        "trend": trend,
+                        "seasonal": seasonal,
+                        "residual": residual
+                    },
+                    "metadata": {
+                        "model": "additive",
+                        "period": 365,
+                        "dataPoints": len(decomp_data),
+                        "dateRange": {
+                            "start": dates[0] if dates else None,
+                            "end": dates[-1] if dates else None
+                        }
+                    }
                 }
-            }
-        }
+                
+                return jsonify(response), 200
         
-        return jsonify(response), 200
+        # 🎯 APPROACH 2: Try BMKG-style embedded in preprocessing_report
+        report = db["preprocessing_report"].find_one({
+            "$or": [
+                {"collection_name": slug},
+                {"original_collection_name": slug}
+            ]
+        })
+        
+        if report:
+            logger.info(f"Found preprocessing report for: {slug}")
+            
+            # Extract decomposition data from embedded report
+            decomposition_data = report.get("preprocessing_details", {}).get("decomposition", {})
+            
+            if not decomposition_data:
+                # Try alternative path
+                decomposition_data = report.get("report_data", {}).get("decomposition", {})
+            
+            if decomposition_data:
+                # Check if parameter exists in decomposition data
+                param_decomp = decomposition_data.get("decomposition_data", {}).get(parameter)
+                
+                if param_decomp:
+                    # Extract components from embedded sample data (BMKG format)
+                    components_sample = param_decomp.get("components_sample", {})
+                    statistics = param_decomp.get("statistics", {})
+                    seasonal_analysis = param_decomp.get("seasonal_analysis", {})
+                    
+                    # Convert sample data to time series format
+                    trend_data = components_sample.get("trend", {})
+                    seasonal_data = components_sample.get("seasonal", {})
+                    residual_data = components_sample.get("residual", {})
+                    
+                    # Convert timestamps and values
+                    if trend_data:
+                        dates = sorted(trend_data.keys())
+                        trend_values = [trend_data.get(date) for date in dates]
+                        seasonal_values = [seasonal_data.get(date) for date in dates]
+                        residual_values = [residual_data.get(date) for date in dates]
+                        
+                        # Reconstruct original from components (trend + seasonal + residual)
+                        original_values = []
+                        for i in range(len(trend_values)):
+                            if trend_values[i] is not None and seasonal_values[i] is not None and residual_values[i] is not None:
+                                original_values.append(trend_values[i] + seasonal_values[i] + residual_values[i])
+                            else:
+                                original_values.append(None)
+                    else:
+                        dates = []
+                        trend_values = []
+                        seasonal_values = []
+                        residual_values = []
+                        original_values = []
+                    
+                    # Prepare BMKG-style response
+                    response = {
+                        "collectionName": slug,
+                        "parameter": parameter,
+                        "dataset_type": "bmkg",
+                        "data_source": "embedded_report",
+                        "decomposition": {
+                            "dates": dates,
+                            "original": original_values,
+                            "trend": trend_values,
+                            "seasonal": seasonal_values,
+                            "residual": residual_values
+                        },
+                        "statistics": statistics,
+                        "indonesian_seasonal_analysis": seasonal_analysis,
+                        "metadata": {
+                            "model": param_decomp.get("method", "STL_robust"),
+                            "period": param_decomp.get("period", 365),
+                            "robust": True,
+                            "total_data_points": statistics.get("data_points", 0),
+                            "trend_strength": statistics.get("trend_strength", 0),
+                            "seasonal_strength": statistics.get("seasonal_strength", 0),
+                            "trend_direction": statistics.get("trend_direction", "unknown"),
+                            "dataPoints": len(dates),
+                            "dateRange": {
+                                "start": dates[0] if dates else None,
+                                "end": dates[-1] if dates else None
+                            },
+                            "note": "Sample data (last 90 days) from embedded STL decomposition"
+                        }
+                    }
+                    
+                    return jsonify(response), 200
+                else:
+                    # Parameter not found in decomposition data
+                    available_params = list(decomposition_data.get("decomposition_data", {}).keys())
+                    return jsonify({
+                        "message": f"No decomposition data found for parameter '{parameter}' in embedded report",
+                        "available_parameters": available_params,
+                        "dataset_type": "bmkg"
+                    }), 404
+        
+        # 🚫 NO DATA FOUND - Provide helpful error message
+        return jsonify({
+            "message": "Decomposition data not found",
+            "details": {
+                "checked_nasa_collection": decomp_collection_name,
+                "checked_embedded_report": "preprocessing_report",
+                "dataset_type_detected": dataset_type,
+                "parameter_requested": parameter
+            },
+            "suggestions": [
+                "Dataset may need reprocessing with decomposition enabled",
+                f"For NASA datasets, expected collection: {decomp_collection_name}",
+                "For BMKG datasets, decomposition should be embedded in preprocessing_report",
+                "Verify parameter name matches dataset type (NASA: T2M, RH2M; BMKG: RR, TX, TN)"
+            ]
+        }), 404
         
     except Exception as e:
         logger.error(f"Error fetching decomposition data: {str(e)}")
