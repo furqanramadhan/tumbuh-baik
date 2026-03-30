@@ -721,7 +721,6 @@ class BmkgPreprocessor:
         Returns:
             Dictionary with preprocessing results
         """
-        
         try:
             start_time = datetime.now()
             logger.info("PROGRESS: Starting BMKG preprocessing pipeline...")
@@ -730,7 +729,7 @@ class BmkgPreprocessor:
                 self.options.update(options)
             
             # Step 1: Validate dataset
-            logger.info("\n[1/6] Validating dataset...")
+            logger.info("\n[1/7] Validating dataset...")
             validation_result = self.validator.validate_dataset(
                 self.db, self.collection_name
             )
@@ -749,37 +748,32 @@ class BmkgPreprocessor:
                     logger.warning(f"  - {warning}")
                     
             # Step 2: Load data
-            logger.info("\n[2/6] Loading data from MongoDB...")
+            logger.info("\n[2/7] Loading data from MongoDB...")
             df = self.loader.load_data(self.db, self.collection_name)
             original_record_count = len(df)
             
-            # Don't save original data here (has RangeIndex)
-            # self.original_data = df.copy()  # ❌ Index is RangeIndex, not DatetimeIndex
-            
-            # NEW CODE:
-            # self.original_data will be set in _apply_preprocessing() 
-            # after _prepare_temporal_features() runs (DatetimeIndex)
+            # NEW CODE: self.original_data will be set in _apply_preprocessing() 
             self.original_data = None  # Initialize as None
             
             logger.info(f"Loaded {original_record_count} records")
                 
             # Step 3: Apply preprocessing
-            logger.info("\n[3/6] Applying preprocessing pipeline...")
+            logger.info("\n[3/7] Applying preprocessing pipeline...")
             processed_df = self._apply_preprocessing(df)
             logger.info("Preprocessing completed")
             
             # Step 4: Validate smoothing quality (GCV + Trend)
-            logger.info("\n[4/6] Validating preprocessing quality...")
+            logger.info("\n[4/7] Validating preprocessing quality...")
             self._validate_preprocessing_quality(processed_df)
             logger.info("Quality validation completed")
             
             # Step 5: Calculate model coverage
-            logger.info("\n[5/6] Calculating model coverage (HW & LSTM)...")
+            logger.info("\n[5/7] Calculating model coverage (HW & LSTM)...")
             self._calculate_model_coverage(processed_df)
             logger.info("Coverage analysis completed")
             
             # Step 6: Save preprocessed data
-            logger.info("\n[6/6] Saving preprocessed data...")
+            logger.info("\n[6/7] Saving preprocessed data...")
             save_result = self.saver.save_preprocessed_data(
                 self.db,
                 processed_df,
@@ -787,15 +781,30 @@ class BmkgPreprocessor:
             )            
             cleaned_collection = save_result.get("preprocessedCollections", [])[0] if save_result.get("preprocessedCollections") else None
             
+            # STEP 1: Save preprocessing_report FIRST (to get preprocessing_id)
             report_save_result = self._save_preprocessing_report(
                 cleaned_collection or self.collection_name
             )
+            
+            preprocessing_id = report_save_result.get("report_id")  # ObjectId
+            
+            # STEP 2: Calculate and save decomposition (uses preprocessing_id as reference)
+            logger.info("\n[7/7] Calculating and saving STL decomposition...")
+            if preprocessing_id and report_save_result.get("status") == "success":
+                try:
+                    self._calculate_and_save_decomposition(processed_df, preprocessing_id)
+                    decomposition_saved = True
+                    logger.info("Decomposition data saved to decomposition_report collection")
+                except Exception as e:
+                    logger.error(f"Failed to save decomposition: {str(e)}")
+                    logger.error(traceback.format_exc())  # Tambahkan traceback untuk debug
+                    decomposition_saved = False
             
             # Generate final report 
             end_time = datetime.now()
             processing_time = (end_time - start_time).total_seconds()
             
-             # Generate quality metrics
+            # Generate quality metrics
             self._generate_quality_metrics(df, processed_df)
             
             logger.info("PREPROCESSING COMPLETED SUCCESSFULLY")
@@ -813,11 +822,12 @@ class BmkgPreprocessor:
                 "preprocessedCollections": save_result.get("preprocessedCollections", []),
                 "cleanedCollection": cleaned_collection,
                 "processingTime": round(processing_time, 2),
-                "preprocessing_report": self._sanitize_for_mongodb(self.preprocessing_report),  # Sanitized report
-                "validation_result": validation_result,
-                "metadata": save_result.get("metadata", {}),
+                "preprocessing_report_id": str(preprocessing_id) if preprocessing_id else None,
                 "report_saved": report_save_result.get("status") == "success",
-                "report_id": report_save_result.get("report_id")
+                "decomposition_saved": decomposition_saved,
+                "decomposition_collection": "decomposition_report" if decomposition_saved else None,
+                "validation_result": validation_result,
+                "metadata": save_result.get("metadata", {})
             }
         except Exception as e:
             error_msg = f"Error during preprocessing: {str(e)}"
@@ -849,7 +859,7 @@ class BmkgPreprocessor:
             # Parameters to process
             "columns_to_process": self.params_to_process,
             
-            # NEW: Parameter-specific configurations
+            # Parameter-specific configurations
             "parameter_configs": {
                 # FORECASTING CRITICAL - Full imputation effort
                 "TAVG": {
@@ -933,15 +943,15 @@ class BmkgPreprocessor:
         processed_df = df.copy()
             
         # Step 1: Prepare temporal features
-        logger.info("[1/7] Preparing temporal features...")
+        logger.info("[1/6] Preparing temporal features...")
         processed_df = self._prepare_temporal_features(processed_df)
         
         # Step 2: Replace fill values
-        logger.info("[2/7] Replacing fill values...")
+        logger.info("[2/6] Replacing fill values...")
         processed_df = self._replace_fill_values(processed_df)
 
         # Step 2.5: Detect and fix suspicious zeros in wind data (NEW)
-        logger.info("[2.5/7] Detecting suspicious zeros...")
+        logger.info("[2.5/6] Detecting suspicious zeros...")
         processed_df = self._detect_and_fix_suspicious_zeros(processed_df)
 
         # Save original_data AFTER fill values replaced and suspicious zeros fixed
@@ -952,26 +962,24 @@ class BmkgPreprocessor:
         
         # Step 3: Detect gaps
         if self.options.get("detect_gaps", True):
-            logger.info("[3/7] Detecting gaps...")
+            logger.info("[3/6] Detecting gaps...")
             self._detect_gaps(processed_df)
         
         # Step 4: Detect and handle outliers
         if self.options.get("detect_outliers", True):
-            logger.info("[4/7] Detecting and handling outliers...")
+            logger.info("[4/6] Detecting and handling outliers...")
             processed_df = self._handle_outliers(processed_df)
         
         # Step 5: Impute missing values with gap-aware wind handling (MODIFIED)
         if self.options.get("fill_missing", True):
-            logger.info("[5/7] Imputing missing values with gap-aware logic")
+            logger.info("[5/6] Imputing missing values with gap-aware logic")
             processed_df = self._impute_missing_values(processed_df)
         
         # Step 6: Apply physical constraints
-        logger.info("[6/7] Applying physical constraints...")
+        logger.info("[6/6] Applying physical constraints...")
         processed_df = self._apply_physical_constraints(processed_df)
         
-        # Step 7 : Calculate and embed STL decomposition 
-        logger.info("[7/7] Calculating and embedding STL decomposition...")
-        self._calculate_and_embed_decomposition(processed_df)
+        # REMOVED: Step 7 decomposition call (moved to preprocess())
         
         logger.info("preprocessing pipeline completed")
         return processed_df
@@ -2112,7 +2120,7 @@ class BmkgPreprocessor:
         # Apply physical constraints (0-100%)
         df['RH_AVG'] = df['RH_AVG'].clip(0, 100)
         
-        # NEW: Calculate and store confidence for uncertainty penalty
+        # Calculate and store confidence for uncertainty penalty
         if 'RH_AVG' in df.columns:
             confidence = self._calculate_interpolation_confidence(df, 'RH_AVG')
             self.imputation_confidence['RH_AVG'] = confidence
@@ -3597,107 +3605,136 @@ class BmkgPreprocessor:
             "trend_value": trend_preservation,  # For trend penalty calculation
             "message": f"GCV={gcv_score:.4f}, Trend={trend_preservation:.2f}%"
         }
-        
-    def _calculate_and_embed_decomposition(
+    
+    def _calculate_and_save_decomposition(
         self,
-        df: pd.DataFrame
-    )-> None:
+        df: pd.DataFrame,
+        preprocessing_id: ObjectId
+    ) -> None:
         """
-        Calculate STL seasonal decomposition and embed results in preprocessing report
-        
-        Key Differences from NASA:
-        - Uses STL decomposition (more robust for outliers)
-        - Handles Indonesian wet/dry seasonal patterns  
-        - Parameters: ['RR', 'TX', 'TN', 'TAVG', 'RH_AVG', 'FF_X', 'FF_AVG', 'DDD_X', 'SS']
+        Calculate seasonal decomposition and save ONE document per preprocessing
+        containing all parameters.
         """
-        logger.info("Calculating STL decomposition for BMKG...")
-        
-        params = ['RR', 'TX', 'TN', 'TAVG', 'RH_AVG', 'FF_X', 'FF_AVG', 'DDD_X', 'SS']
-        decomposition_data = {
-            "parameters_decomposed": [],
-            "decomposition_data": {}
-        }
-        
+        logger.info("Calculating seasonal decomposition for all parameters...")
+
+        params = self.options.get("columns_to_process", [])
+        parameters_dict = {}          # akan menampung data per parameter
+        total_data_points = 0
+        successful_params = []
+
         for param in params:
+            # Skip non-numeric
+            if param == 'DDD_CAR':
+                continue
+                
             if param not in df.columns:
+                logger.warning(f"{param}: Not found in dataframe, skipping")
                 continue
-        
-            # Check minimum data requirement (+2 years)
-            if len(df)< 730:
-                logger.warning(f"{param}: Insufficient data for STL decomposition ({len(df)} days < 730)")
+
+            # Minimal 2 tahun data (730 hari)
+            if len(df) < 730:
+                logger.warning(f"{param}: Insufficient data for decomposition ({len(df)} days < 730)")
                 continue
-        
+
             try:
                 series = df[param].dropna()
                 if len(series) < 730:
                     logger.warning(f"{param}: Insufficient valid data after dropping NaN ({len(series)} < 730)")
                     continue
-            
-                logger.info(f"Decomposing {param} using STL")
-                
-                # STL decomposition with Indonesian seasonal patterns
-                stl = STL(series, period=365, robust=True, seasonal=13)  # 13 for seasonal smoothing
+
+                logger.info(f"{param}: Decomposing original data...")
+
+                stl = STL(series, period=365, robust=True)
                 result = stl.fit()
-                
-                # Extract components
-                trend = result.trend.dropna()
-                seasonal = result.seasonal.dropna()
-                residual = result.resid.dropna()
-                
-                # Calculate Indonesian wet/dry season statistics
-                wet_months = [9, 10, 11, 12, 1, 2, 3]  # Sep-Mar
-                dry_months = [4, 5, 6, 7, 8]            # Apr-Aug
-                
-                # Seasonal analysis by Indonesian patterns
-                wet_seasonal = seasonal[seasonal.index.month.isin(wet_months)]
-                dry_seasonal = seasonal[seasonal.index.month.isin(dry_months)]
-                
-                seasonal_stats = {
-                    "wet_season_avg": float(wet_seasonal.mean()) if len(wet_seasonal) > 0 else 0.0,
-                    "dry_season_avg": float(dry_seasonal.mean()) if len(dry_seasonal) > 0 else 0.0,
-                    "seasonal_amplitude": float(seasonal.max() - seasonal.min()),
-                    "wet_dry_difference": float(wet_seasonal.mean() - dry_seasonal.mean()) if len(wet_seasonal) > 0 and len(dry_seasonal) > 0 else 0.0
+
+                # Hitung seasonal strength
+                seasonal_var = np.var(result.seasonal.dropna())
+                residual_var = np.var(result.resid.dropna())
+                if seasonal_var + residual_var == 0:
+                    seasonal_strength = 0.0
+                else:
+                    seasonal_strength = seasonal_var / (seasonal_var + residual_var)
+
+                # Bangun array data untuk parameter ini
+                data_array = []
+                for i in range(len(series)):
+                    date_idx = series.index[i]
+                    
+                    data_array.append({
+                        "Date": date_idx,  # Datetime object (MongoDB native)
+                        "original": float(series.iloc[i]) if pd.notna(series.iloc[i]) else None,
+                        "trend": float(result.trend.iloc[i]) if pd.notna(result.trend.iloc[i]) else None,
+                        "seasonal": float(result.seasonal.iloc[i]) if pd.notna(result.seasonal.iloc[i]) else None,
+                        "residual": float(result.resid.iloc[i]) if pd.notna(result.resid.iloc[i]) else None
+                    })
+
+                # Simpan ke dictionary parameter
+                parameters_dict[param] = {
+                    "seasonal_strength": round(float(seasonal_strength), 3),
+                    "data": data_array
                 }
+                total_data_points += len(data_array)
+                successful_params.append(param)
                 
-                # Calculate decomposition statistics
-                decomp_stats = {
-                    "trend_strength": self._calculate_trend_strength(series, result.trend, result.resid),  # ← FIX: Pass residual
-                    "seasonal_strength": self._calculate_seasonal_strength(series, seasonal, result.resid),  # Also use actual residual
-                    "data_points": len(series),
-                    "trend_direction": "increasing" if trend.iloc[-1] > trend.iloc[0] else "decreasing",
-                    "seasonal_stats": seasonal_stats
-                }
-                
-                # Store components (sample for embedding)
-                components_sample = {
-                    "trend": trend.tail(90).to_dict(),      # Last 3 months
-                    "seasonal": seasonal.tail(90).to_dict(), # Last 3 months  
-                    "residual": residual.tail(90).to_dict()  # Last 3 months
-                }
-                
-                decomposition_data["decomposition_data"][param] = {
-                    "method": "STL_robust",
-                    "period": 365,
-                    "statistics": decomp_stats,
-                    "components_sample": components_sample,
-                    "seasonal_analysis": seasonal_stats
-                }
-                
-                decomposition_data["parameters_decomposed"].append(param)
-                
-                logger.info(f"{param}: STL decomposition completed (trend_strength={decomp_stats['trend_strength']:.3f}, seasonal_strength={decomp_stats['seasonal_strength']:.3f})")
+                logger.info(f"{param}: Decomposition successful ({len(data_array)} points)")
 
             except Exception as e:
-                logger.error(f"Error decomposing {param}: {str(e)}")
-                decomposition_data["decomposition_data"][param] = {
-                    "error": str(e),
-                    "status": "failed"
-                }
-        # Store in preprocessing report
-        self.preprocessing_report["decomposition"] = decomposition_data
-    
-        success_count = len(decomposition_data["parameters_decomposed"])
-        logger.info(f"STL decomposition completed: {success_count}/{len(params)} parameters successfully decomposed")
+                logger.error(f"{param}: Decomposition failed - {str(e)}")
+                logger.error(traceback.format_exc())
+                self.preprocessing_report["warnings"].append(f"Failed to decompose {param}: {str(e)}")
+                continue
+
+        # VALIDASI: Pastikan ada data sebelum insert
+        if not parameters_dict:
+            logger.warning("No parameters successfully decomposed. Skipping save.")
+            self.preprocessing_report["decomposition_summary"] = {
+                "parameters_decomposed": [],
+                "total_documents": 0,
+                "total_data_points": 0,
+                "collection": "decomposition_report",
+                "status": "no_data"
+            }
+            return
+
+        # Buat satu dokumen gabungan
+        combined_doc = {
+            "preprocessing_id": preprocessing_id,
+            "dataset_name": self.collection_name,
+            "dataset_type": "bmkg",
+            "decomposition_method": "STL",
+            "timestamp": datetime.now(),
+            "parameters": parameters_dict,
+        }
+
+        try:
+            result = self.db["decomposition_report"].insert_one(combined_doc)
+            logger.info(
+                f"Saved decomposition document: {len(parameters_dict)} parameters, "
+                f"{total_data_points} points (ID: {result.inserted_id})"
+            )
+
+            # Update ringkasan di preprocessing_report
+            self.preprocessing_report["decomposition_summary"] = {
+                "parameters_decomposed": successful_params,
+                "total_documents": 1,
+                "total_data_points": total_data_points,
+                "collection": "decomposition_report",
+                "document_id": str(result.inserted_id),
+                "status": "success"
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to save decomposition to MongoDB: {str(e)}")
+            logger.error(traceback.format_exc())
+            
+            self.preprocessing_report["decomposition_summary"] = {
+                "parameters_decomposed": successful_params,
+                "total_documents": 0,
+                "total_data_points": total_data_points,
+                "collection": "decomposition_report",
+                "status": "save_failed",
+                "error": str(e)
+            }
         
     def _calculate_trend_strength(self, series: pd.Series, trend: pd.Series, residual: pd.Series) -> float:
         """
@@ -4466,7 +4503,7 @@ class BmkgPreprocessor:
         self.preprocessing_report["quality_metrics"] = {
             "parameter_details": quality_metrics,
             
-            # NEW: Forecasting readiness sections
+            # Forecasting readiness sections
             "forecasting_readiness": {
                 "critical_parameters": forecasting_readiness,
                 "supporting_parameters": supporting_status,
@@ -4490,40 +4527,120 @@ class BmkgPreprocessor:
         Save unified preprocessing report to MongoDB preprocessing_report collection
         Compatible with NASA structure for unified frontend consumption
         """
-        
         try:
-            # Generate report metadata
-            report_metadata = {
+            # Prepare simplified report document
+            report_doc = {
                 "dataset_type": "bmkg",
-                "collection_name": self.collection_name,
+                "original_collection_name": self.collection_name,
                 "cleaned_collection_name": cleaned_collection_name,
-                "created_at": datetime.now(),
-                "processing_time": None,  # Will be calculated in preprocess()
-                "total_parameters": len(self.params_to_process),
-                "parameters_processed": list(self.preprocessing_report.get("imputation", {}).keys())
+                "preprocessing_timestamp": datetime.now(),
+                
+                # Preprocessing Summary (simplified inline)
+                "preprocessing_summary": {
+                    "missing_data": {
+                        "fill_values_replaced": self.preprocessing_report.get("missing_data", {}).get("fill_values_replaced", {}),
+                        # INLINE imputation simplification
+                        "imputation_summary": {
+                            "total_imputed": sum(
+                                data.get("imputed", 0) 
+                                for data in self.preprocessing_report.get("imputation", {}).values()
+                            ),
+                            "per_parameter": {
+                                param: {
+                                    "imputed": data.get("imputed", 0),
+                                    "success_rate": data.get("success_rate", 0),
+                                    "method": data.get("method", "unknown")
+                                    # NO before/after counts
+                                } for param, data in self.preprocessing_report.get("imputation", {}).items()
+                            }
+                        }
+                    },
+                    "outliers": self.preprocessing_report.get("outliers", {}),
+                    "physical_constraints": self.preprocessing_report.get("physical_constraints", {}),
+                    "gaps_summary": {
+                        "total_gaps": self.preprocessing_report.get("gaps", {}).get("total_gaps", 0),
+                        "small_gaps": self.preprocessing_report.get("gaps", {}).get("small_gaps", 0),
+                        "medium_gaps": self.preprocessing_report.get("gaps", {}).get("medium_gaps", 0),
+                        "large_gaps": self.preprocessing_report.get("gaps", {}).get("large_gaps", 0)
+                        # NO gap_details[] array
+                    },
+                    "suspicious_zeros": self.preprocessing_report.get("suspicious_zeros", {})
+                },
+                
+                # Quality Metrics (keep full)
+                "quality_metrics": self.preprocessing_report.get("quality_metrics", {}),
+                
+                # INLINE smoothing validation simplification
+                "smoothing_validation": {
+                    param: {
+                        "gcv_score": data.get("gcv_score"),
+                        "trend_preservation_pct": data.get("trend_preservation_pct"),
+                        "quality_status": data.get("quality_status")
+                        # NO data_points, NO imputation_method
+                    } for param, data in self.preprocessing_report.get("smoothing_validation", {}).items()
+                    if isinstance(data, dict) and "gcv_score" in data
+                },
+                
+                # INLINE model coverage simplification
+                "model_coverage": {
+                    # Keep aggregate results
+                    "aggregate_hw_uncovered": self.preprocessing_report.get("model_coverage", {}).get("aggregate_hw_uncovered", {}),
+                    "aggregate_lstm_uncovered": self.preprocessing_report.get("model_coverage", {}).get("aggregate_lstm_uncovered", {}),
+                    "overall_hw_coverage": self.preprocessing_report.get("model_coverage", {}).get("overall_hw_coverage", 0),
+                    "overall_lstm_coverage": self.preprocessing_report.get("model_coverage", {}).get("overall_lstm_coverage", 0),
+                    "per_parameter": {
+                        param: {
+                            "holt_winters_coverage": data.get("holt_winters_coverage"),
+                            "lstm_coverage": data.get("lstm_coverage"),
+                            "recommended_model": data.get("recommended_model"),
+                            "seasonality_strength": data.get("seasonality_strength"),
+                            "is_stationary": data.get("is_stationary"),
+                            # Only include uncovered if not empty
+                            **({
+                                "holt_winters_uncovered": data["holt_winters_uncovered"]
+                            } if data.get("holt_winters_uncovered") else {}),
+                            **({
+                                "lstm_uncovered": data["lstm_uncovered"] 
+                            } if data.get("lstm_uncovered") else {})
+                            # NO analysis_details!
+                        } for param, data in self.preprocessing_report.get("model_coverage", {}).get("per_parameter", {}).items()
+                    }
+                },
+                
+                # Decomposition Summary ONLY (not the data)
+                "decomposition_summary": self.preprocessing_report.get("decomposition_summary", {}),
+                
+                # Warnings (filtered to important ones)
+                "warnings": [w for w in self.preprocessing_report.get("warnings", []) 
+                            if "Large gap" in w or "quality is poor" in w],
+                
+                # Status
+                "status": "success",
+                
+                # Record counts
+                "record_count": {
+                    "original": len(self.original_data) if self.original_data is not None else 0,
+                    "processed": self.preprocessing_report.get("quality_metrics", {}).get("forecasting_readiness", {}).get("overall_forecasting_score", 0)
+                }
             }
             
-            # Combine report with metadata
-            unified_report = {
-                **report_metadata,
-                "preprocessing_details": self.preprocessing_report
-            }
+            # Sanitize for MongoDB 
+            sanitized_document = self._sanitize_for_mongodb(report_doc)
             
-            # Sanitize for MongoDB
-            sanitized_report = self._sanitize_for_mongodb(unified_report)
+            # Insert into preprocessing_report collection
+            result = self.db["preprocessing_report"].insert_one(sanitized_document)
             
-            # Save to preprocessing_report collection
-            result = self.db["preprocessing_report"].insert_one(sanitized_report)
-            
-            logger.info(f"Saved unified preprocessing report with ID: {result.inserted_id}")
+            logger.info(f"Simplified preprocessing report saved with ID: {result.inserted_id}")
             
             return {
                 "status": "success",
-                "report_id": str(result.inserted_id),
+                "report_id": result.inserted_id,  # ← ObjectId (NOT STRING!)
                 "collection": "preprocessing_report"
             }
+            
         except Exception as e:
-            logger.error(f"Error saving preprocessing report: {str(e)}")
+            error_msg = f"Error saving preprocessing report: {str(e)}"
+            logger.error(error_msg)
             return {
                 "status": "error",
                 "error": str(e)
