@@ -65,6 +65,7 @@ import {
   PlusCircle,
   Notebook,
   GitCompare,
+  Zap,
 } from "lucide-react";
 
 export type Icon = LucideIcon;
@@ -156,6 +157,7 @@ export const Icons = {
   waves: Waves,
   lineChart: LineChart,
   gitCompare: GitCompare,
+  zap: Zap,
 
   // Custom SVG Icons
   logo: (props: LucideProps) => (

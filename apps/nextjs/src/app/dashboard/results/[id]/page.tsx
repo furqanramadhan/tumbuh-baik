@@ -13,6 +13,7 @@ import { id as localeId } from "date-fns/locale";
 import { PreprocessingSummary } from "../../_components/preprrocessing-summary/preprocessing-summary";
 import { MetricsCharts } from "../../_components/chart/metrics-charts";
 import ComparisonChart from "@/app/dashboard/_components/chart/comparison-chart";
+import { DecompositionChart } from "@/app/dashboard/_components/chart/decomposition-chart";
 
 import {
   Breadcrumb,
@@ -183,7 +184,6 @@ export default function ResultDetailsPage({
         </Card>
       </div>
 
-      {/* Placeholders for Phase 3-6 */}
       <div className="mt-8 rounded-lg border-2 border-dashed border-muted p-8 text-center text-muted-foreground">
         <PreprocessingSummary report={preprocessingReport} />
         <MetricsCharts report={preprocessingReport} />
@@ -192,12 +192,17 @@ export default function ResultDetailsPage({
         originalCollectionName={preprocessingReport.original_collection_name}
         cleanedCollectionName={preprocessingReport.cleaned_collection_name}
       />
-      <div className="rounded-lg border-2 border-dashed border-muted p-8 text-center text-muted-foreground">
-        <h2>[Phase 5: Decomposition Plot will go here]</h2>
-      </div>
-      <div className="rounded-lg border-2 border-dashed border-muted p-8 text-center text-muted-foreground">
-        <h2>[Phase 6: Data View (Table/Calendar) will go here]</h2>
-      </div>
+      {/* PHASE 5: Mount Decomposition Plot */}
+      {decompositionReport ? (
+        <div className="mt-8">
+          {/* Use the page 'id' because the backend API route is /preprocessing-report/:id/decomposition */}
+          <DecompositionChart preprocessingId={id} />
+        </div>
+      ) : (
+        <div className="rounded-lg border-2 border-dashed border-muted p-8 text-center text-muted-foreground mt-8">
+          <p>Data dekomposisi tidak tersedia untuk dataset ini.</p>
+        </div>
+      )}
     </div>
   );
 }

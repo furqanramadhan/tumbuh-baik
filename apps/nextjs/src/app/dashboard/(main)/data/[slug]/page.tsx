@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 // import { Metadata } from "next";
 import ChartSection from "@/app/dashboard/_components/chart/dataset-chart";
 import DynamicMainTable from "../_components/dynamic-table";
-import { DecompositionChart } from "@/app/dashboard/_components/chart/decomposition-chart";
+// import { DecompositionChart } from "@/app/dashboard/_components/chart/decomposition-chart";
 
 interface Props {
   params: Promise<{ slug: string }>;
@@ -30,9 +30,9 @@ export default async function DatasetDetailPage({ params }: Props) {
       <ChartSection collectionName={meta.collectionName} />
 
       {/* Show decomposition chart only for preprocessed datasets */}
-      {meta.status === "preprocessed" && (
+      {/* {meta.status === "preprocessed" && (
         <DecompositionChart collectionName={meta.collectionName} />
-      )}
+      )} */}
     </div>
   );
 }

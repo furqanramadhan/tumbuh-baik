@@ -30,31 +30,9 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
-import { Calendar, Activity, TrendingUp, Waves, Zap } from "lucide-react";
-
-// TYPE DEFINITIONS
-interface DecompositionMetadata {
-  dateRange: {
-    start: string;
-    end: string;
-  };
-  model: string;
-  period: number;
-  dataPoints: number;
-}
-
-interface DecompositionValues {
-  dates: string[];
-  original: number[];
-  trend: (number | null)[];
-  seasonal: (number | null)[];
-  residual: (number | null)[];
-}
-
-interface DecompositionData {
-  decomposition: DecompositionValues;
-  metadata: DecompositionMetadata;
-}
+import { Icons } from "@/app/dashboard/_components/icons";
+import { getDecompositionByPreprocessingId } from "@/lib/fetch/files.fetch";
+import { useMemo } from "react";
 
 interface ChartDataPoint {
   date: string;
@@ -78,47 +56,13 @@ interface DecompositionStats {
 }
 
 interface DecompositionChartProps {
-  collectionName: string;
+  preprocessingId: string;
 }
 
 interface ParameterDecompositionViewProps {
   param: string;
-  collectionName: string;
-}
-
-// API FUNCTIONS (TODO: Implement these with your actual API)
-
-/**
- * Fetch decomposition data for a specific parameter
- * TODO: Replace this with your actual API call
- */
-async function GetDecompositionDataBySlug(
-  collectionName: string,
-  param: string
-): Promise<DecompositionData> {
-  // Mock implementation - replace with actual API call
-  const response = await fetch(
-    `/api/decomposition/${collectionName}/${param}`
-  );
-  if (!response.ok) {
-    throw new Error("Failed to fetch decomposition data");
-  }
-  return response.json();
-}
-
-/**
- * Fetch available parameters for decomposition
- * TODO: Replace this with your actual API call
- */
-async function GetAvailableDecompositionParameters(
-  collectionName: string
-): Promise<string[]> {
-  // Mock implementation - replace with actual API call
-  const response = await fetch(`/api/decomposition/${collectionName}/params`);
-  if (!response.ok) {
-    throw new Error("Failed to fetch available parameters");
-  }
-  return response.json();
+  paramData: any;
+  decompositionMethod: string;
 }
 
 // CONFIGURATION & CONSTANTS
@@ -141,8 +85,8 @@ const chartConfig = {
   },
 } satisfies ChartConfig;
 
-// Parameter labels and units
 const paramLabels: Record<string, string> = {
+  // NASA
   T2M: "Suhu Udara (2m)",
   T2M_MAX: "Suhu Maksimum",
   T2M_MIN: "Suhu Minimum",
@@ -152,9 +96,21 @@ const paramLabels: Record<string, string> = {
   WS10M: "Kecepatan Angin",
   WS10M_MAX: "Kecepatan Angin Maksimum",
   WD10M: "Arah Angin",
+  // BMKG
+  TN: "Temperatur Minimum",
+  TX: "Temperatur Maksimum",
+  TAVG: "Temperatur Rata-rata",
+  RH_AVG: "Kelembapan Rata-rata",
+  RR: "Curah Hujan",
+  SS: "Lamanya Penyinaran Matahari",
+  FF_X: "Kecepatan Angin Maksimum",
+  DDD_X: "Arah Angin saat Kecepatan Maksimum",
+  FF_AVG: "Kecepatan Angin Rata-rata",
+  DDD_CAR: "Arah Angin Terbanyak",
 };
 
 const paramUnits: Record<string, string> = {
+  // NASA
   T2M: "°C",
   T2M_MAX: "°C",
   T2M_MIN: "°C",
@@ -164,6 +120,17 @@ const paramUnits: Record<string, string> = {
   WS10M: "m/s",
   WS10M_MAX: "m/s",
   WD10M: "degrees",
+  // BMKG
+  TN: "°C",
+  TX: "°C",
+  TAVG: "°C",
+  RH_AVG: "%",
+  RR: "mm",
+  SS: "jam",
+  FF_X: "m/s",
+  DDD_X: "derajat",
+  FF_AVG: "m/s",
+  DDD_CAR: "°",
 };
 
 // UTILITY FUNCTIONS
@@ -173,56 +140,6 @@ function getParamLabel(param: string): string {
 
 function getParamUnit(param: string): string {
   return paramUnits[param] || "";
-}
-
-/**
- * Transform API data to chart-ready format
- */
-function transformDecompositionData(
-  data: DecompositionData
-): ChartDataPoint[] {
-  return data.decomposition.dates.map((date: string, index: number) => {
-    const dateObj = new Date(date);
-    return {
-      date: dateObj.getFullYear().toString(),
-      fullDate: dateObj.toLocaleDateString("id-ID", {
-        weekday: "long",
-        year: "numeric",
-        month: "long",
-        day: "numeric",
-      }),
-      original: data.decomposition.original[index],
-      trend: data.decomposition.trend[index],
-      seasonal: data.decomposition.seasonal[index],
-      residual: data.decomposition.residual[index],
-      year: dateObj.getFullYear(),
-    };
-  });
-}
-
-/**
- * Calculate statistics for each component
- */
-function calculateDecompositionStats(
-  data: DecompositionData
-): DecompositionStats {
-  const filterNulls = (arr: (number | null)[]): number[] =>
-    arr.filter((v): v is number => v !== null);
-
-  return {
-    trend: {
-      min: Math.min(...filterNulls(data.decomposition.trend)),
-      max: Math.max(...filterNulls(data.decomposition.trend)),
-    },
-    seasonal: {
-      min: Math.min(...filterNulls(data.decomposition.seasonal)),
-      max: Math.max(...filterNulls(data.decomposition.seasonal)),
-    },
-    residual: {
-      min: Math.min(...filterNulls(data.decomposition.residual)),
-      max: Math.max(...filterNulls(data.decomposition.residual)),
-    },
-  };
 }
 
 /**
@@ -241,9 +158,7 @@ function calculateTickInterval(chartData: ChartDataPoint[]): number {
   }
 }
 
-
 // UI COMPONENTS
-
 
 function LoadingSkeleton() {
   return (
@@ -273,7 +188,7 @@ function EmptyState({ message }: { message?: string }) {
   return (
     <Card className="border-dashed">
       <CardContent className="flex flex-col items-center justify-center py-16">
-        <Activity className="h-12 w-12 text-muted-foreground mb-4" />
+        <Icons.activity className="h-12 w-12 text-muted-foreground mb-4" />
         <p className="font-medium text-lg">
           {message || "Tidak ada data dekomposisi"}
         </p>
@@ -285,440 +200,379 @@ function EmptyState({ message }: { message?: string }) {
   );
 }
 
-
-// MAIN COMPONENTS
-
-
 function ParameterDecompositionView({
   param,
-  collectionName,
+  paramData,
+  decompositionMethod,
 }: ParameterDecompositionViewProps) {
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["decomposition", collectionName, param],
-    queryFn: () => GetDecompositionDataBySlug(collectionName, param),
-    refetchOnWindowFocus: false,
-    retry: 1,
-  });
+  // Data mapping
+  const chartData: ChartDataPoint[] = useMemo(() => {
+    if (!paramData?.data || !Array.isArray(paramData.data)) return [];
 
-  if (isLoading) {
+    return paramData.data.map((item: any) => {
+      // Unwrapping MongoDB $date if present, else fallback to standard string
+      const rawDate = item.Date?.$date || item.Date;
+      const dateObj = new Date(rawDate);
+
+      return {
+        date: dateObj.getFullYear().toString(),
+        fullDate: dateObj.toLocaleDateString("id-ID", {
+          weekday: "long",
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+        }),
+        original: item.original,
+        trend: item.trend,
+        seasonal: item.seasonal,
+        residual: item.residual,
+        year: dateObj.getFullYear(),
+      };
+    });
+  }, [paramData]);
+
+  // Calculate stats for min/max  boundaries
+  const stats = useMemo<DecompositionStats | null>(() => {
+    if (!chartData.length) return null;
+
+    const filterNulls = (arr: (number | null)[]): number[] =>
+      arr.filter((v): v is number => v !== null && !isNaN(v));
+
+    const trends = filterNulls(chartData.map((d) => d.trend));
+    const seasonals = filterNulls(chartData.map((d) => d.seasonal));
+    const residuals = filterNulls(chartData.map((d) => d.residual));
+
+    const safelyGetMinMax = (arr: number[]): ComponentStats => {
+      if (arr.length === 0) return { min: 0, max: 0 };
+      return { min: Math.min(...arr), max: Math.max(...arr) };
+    };
+
+    return {
+      trend: safelyGetMinMax(trends),
+      seasonal: safelyGetMinMax(seasonals),
+      residual: safelyGetMinMax(residuals),
+    };
+  }, [chartData]);
+
+  // Skeleton while loading or if data is not ready
+  if (!chartData.length || !stats) {
     return (
       <div className="space-y-4">
-        {[...Array(4)].map((_, i) => (
-          <Card key={i}>
-            <CardHeader>
-              <Skeleton className="h-6 w-48" />
-              <Skeleton className="h-4 w-32" />
-            </CardHeader>
-            <CardContent>
-              <Skeleton className="h-[220px] w-full rounded-lg" />
-            </CardContent>
-          </Card>
-        ))}
+        <Card>
+          <CardHeader>
+            <CardTitle>Memproses {getParamLabel(param)}...</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Skeleton className="h-[220px] w-full rounded-lg" />
+          </CardContent>
+        </Card>
       </div>
     );
   }
 
-  if (error) {
-    return (
-      <Alert variant="destructive">
-        <AlertDescription>
-          {error instanceof Error
-            ? error.message
-            : "Gagal memuat data dekomposisi"}
-        </AlertDescription>
-      </Alert>
-    );
-  }
-
-  if (!data) {
-    return (
-      <EmptyState
-        message={`Tidak ada data dekomposisi untuk ${getParamLabel(param)}`}
-      />
-    );
-  }
-
-  // Transform data and calculate statistics
-  const chartData = transformDecompositionData(data);
-  const stats = calculateDecompositionStats(data);
+  // UI & metadata for decomposition view
+  const dateRange = `${chartData[0]?.fullDate} - ${chartData[chartData.length - 1]?.fullDate}`;
   const tickInterval = calculateTickInterval(chartData);
   const unit = getParamUnit(param);
 
   return (
     <div className="space-y-4">
-      {/* Header Card with Metadata */}
-      <Card>
-        <CardHeader className="pb-4">
-          <div className="space-y-1">
-            <CardTitle className="text-xl font-semibold">
-              {getParamLabel(param)} - Analisis Dekomposisi
+      {/* METADATA CARDS */}
+      <div className="grid gap-4 md:grid-cols-4">
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium">Metode</CardTitle>
+            <Icons.activity className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{decompositionMethod}</div>
+            <p className="text-xs text-muted-foreground mt-1">Dekomposisi</p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium">
+              Seasonal Strength
             </CardTitle>
-            <CardDescription className="flex items-center gap-2">
-              <Calendar className="h-3.5 w-3.5" />
-              Data historis ({data.metadata.dateRange.start} -{" "}
-              {data.metadata.dateRange.end})
-            </CardDescription>
-          </div>
-
-          {/* Statistics Summary */}
-          <div className="grid grid-cols-3 gap-4 pt-4">
-            <div className="space-y-1">
-              <p className="text-xs font-medium flex items-center gap-1.5 text-[hsl(var(--chart-2))]">
-                <TrendingUp className="h-3.5 w-3.5" />
-                Trend
-              </p>
-              <p className="text-sm font-medium tabular-nums">
-                [{stats.trend.min.toFixed(2)}, {stats.trend.max.toFixed(2)}]{" "}
-                {unit}
-              </p>
+            <Icons.zap className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center gap-2">
+              <div className="text-2xl font-bold">
+                {paramData.seasonal_strength?.toFixed(3) || "N/A"}
+              </div>
+              {paramData.seasonal_strength > 0.5 && (
+                <Badge variant="secondary" className="text-[10px]">
+                  Kuat
+                </Badge>
+              )}
             </div>
-            <div className="space-y-1">
-              <p className="text-xs font-medium flex items-center gap-1.5 text-[hsl(var(--chart-3))]">
-                <Waves className="h-3.5 w-3.5" />
-                Seasonal
-              </p>
-              <p className="text-sm font-medium tabular-nums">
-                [{stats.seasonal.min.toFixed(2)},{" "}
-                {stats.seasonal.max.toFixed(2)}] {unit}
-              </p>
-            </div>
-            <div className="space-y-1">
-              <p className="text-xs font-medium flex items-center gap-1.5 text-[hsl(var(--chart-4))]">
-                <Zap className="h-3.5 w-3.5" />
-                Residual
-              </p>
-              <p className="text-sm font-medium tabular-nums">
-                [{stats.residual.min.toFixed(2)},{" "}
-                {stats.residual.max.toFixed(2)}] {unit}
-              </p>
-            </div>
-          </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Pengaruh musiman
+            </p>
+          </CardContent>
+        </Card>
 
-          {/* Model Info */}
-          <div className="flex gap-2 pt-2">
-            <Badge variant="outline" className="text-xs">
-              Model: {data.metadata.model}
-            </Badge>
-            <Badge variant="outline" className="text-xs">
-              Period: {data.metadata.period} days
-            </Badge>
-            <Badge variant="outline" className="text-xs">
-              Data Points: {data.metadata.dataPoints.toLocaleString()}
-            </Badge>
-          </div>
-        </CardHeader>
-      </Card>
+        <Card className="md:col-span-2">
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium">Rentang Waktu</CardTitle>
+            <Icons.calendar className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <div className="text-lg font-bold">{dateRange}</div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Total {chartData.length.toLocaleString("id-ID")} hari observasi
+            </p>
+          </CardContent>
+        </Card>
+      </div>
 
-      {/* Chart 1: Original Series */}
+      {/* CHART 1: ORIGINAL */}
       <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base font-semibold flex items-center gap-2">
-            <div className="w-3 h-3 rounded-full bg-[hsl(var(--chart-1))]"></div>
-            Original Series
-          </CardTitle>
-          <CardDescription className="text-xs">
-            Raw time series data before decomposition
-          </CardDescription>
+        <CardHeader className="py-3">
+          <div className="flex items-center gap-2">
+            <Icons.activity className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-sm">Data Original</CardTitle>
+          </div>
         </CardHeader>
-        <CardContent>
-          <ChartContainer config={chartConfig} className="h-[220px] w-full">
+        <CardContent className="pb-4">
+          <ChartContainer
+            config={chartConfig}
+            style={{ height: "150px", width: "100%" }}
+          >
             <LineChart
               data={chartData}
-              margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
+              syncId="decomposition-sync"
+              margin={{ top: 5, right: 10, left: 10, bottom: 0 }}
             >
-              <CartesianGrid
-                strokeDasharray="3 3"
-                vertical={false}
-                className="stroke-muted"
-              />
+              <CartesianGrid strokeDasharray="3 3" vertical={false} />
               <XAxis
                 dataKey="date"
                 tickLine={false}
                 axisLine={false}
                 tickMargin={8}
+                minTickGap={32}
                 interval={tickInterval}
-                className="text-xs"
-                tick={{ fill: "hsl(var(--muted-foreground))" }}
               />
               <YAxis
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
+                domain={["auto", "auto"]}
                 width={50}
-                className="text-xs"
-                tick={{ fill: "hsl(var(--muted-foreground))" }}
-                tickFormatter={(value) => value.toFixed(1)}
+                tickFormatter={(val) => `${val}${unit}`}
+                type="number"
+                allowDataOverflow
               />
               <ChartTooltip
-                cursor={{
-                  stroke: "hsl(var(--muted-foreground))",
-                  strokeWidth: 1,
-                }}
                 content={
                   <ChartTooltipContent
-                    formatter={(value) => [
-                      `${Number(value).toFixed(3)} ${unit}`,
-                      "Original",
-                    ]}
-                    labelFormatter={(label, payload) => {
-                      if (payload?.[0]?.payload?.fullDate) {
-                        return payload[0].payload.fullDate;
-                      }
-                      return label;
-                    }}
+                    labelFormatter={(_, payload) =>
+                      payload[0]?.payload?.fullDate || ""
+                    }
                   />
                 }
               />
               <Line
                 type="monotone"
                 dataKey="original"
-                stroke="hsl(var(--chart-1))"
-                strokeWidth={2}
+                stroke="var(--color-original)"
+                strokeWidth={1}
                 dot={false}
+                isAnimationActive={false}
               />
             </LineChart>
           </ChartContainer>
         </CardContent>
       </Card>
 
-      {/* Chart 2: Trend Component */}
+      {/* CHART 2: TREND */}
       <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base font-semibold flex items-center gap-2">
-            <div className="w-3 h-3 rounded-full bg-[hsl(var(--chart-2))]"></div>
-            Trend Component
-          </CardTitle>
-          <CardDescription className="text-xs">
-            Long-term progression pattern
-          </CardDescription>
+        <CardHeader className="py-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Icons.trendingUp className="h-4 w-4 text-muted-foreground" />
+              <CardTitle className="text-sm">Trend</CardTitle>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Min: {stats.trend.min.toFixed(2)} | Max:{" "}
+              {stats.trend.max.toFixed(2)}
+            </div>
+          </div>
         </CardHeader>
-        <CardContent>
-          <ChartContainer config={chartConfig} className="h-[220px] w-full">
+        <CardContent className="pb-4">
+          <ChartContainer
+            config={chartConfig}
+            style={{ height: "150px", width: "100%" }}
+          >
             <LineChart
               data={chartData}
-              margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
+              syncId="decomposition-sync"
+              margin={{ top: 5, right: 10, left: 10, bottom: 0 }}
             >
-              <CartesianGrid
-                strokeDasharray="3 3"
-                vertical={false}
-                className="stroke-muted"
-              />
+              <CartesianGrid strokeDasharray="3 3" vertical={false} />
               <XAxis
                 dataKey="date"
                 tickLine={false}
                 axisLine={false}
                 tickMargin={8}
+                minTickGap={32}
                 interval={tickInterval}
-                className="text-xs"
-                tick={{ fill: "hsl(var(--muted-foreground))" }}
               />
               <YAxis
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
+                domain={["auto", "auto"]}
                 width={50}
-                className="text-xs"
-                tick={{ fill: "hsl(var(--muted-foreground))" }}
-                tickFormatter={(value) => value.toFixed(1)}
+                tickFormatter={(val) => `${val}${unit}`}
+                type="number"
+                allowDataOverflow
               />
               <ChartTooltip
-                cursor={{
-                  stroke: "hsl(var(--muted-foreground))",
-                  strokeWidth: 1,
-                }}
                 content={
                   <ChartTooltipContent
-                    formatter={(value) => [
-                      `${Number(value).toFixed(3)} ${unit}`,
-                      "Trend",
-                    ]}
-                    labelFormatter={(label, payload) => {
-                      if (payload?.[0]?.payload?.fullDate) {
-                        return payload[0].payload.fullDate;
-                      }
-                      return label;
-                    }}
+                    labelFormatter={(_, payload) =>
+                      payload[0]?.payload?.fullDate || ""
+                    }
                   />
                 }
               />
               <Line
                 type="monotone"
                 dataKey="trend"
-                stroke="hsl(var(--chart-2))"
-                strokeWidth={2.5}
+                stroke="var(--color-trend)"
+                strokeWidth={1.5}
                 dot={false}
+                isAnimationActive={false}
               />
             </LineChart>
           </ChartContainer>
         </CardContent>
       </Card>
 
-      {/* Chart 3: Seasonal Component */}
+      {/* CHART 3: SEASONAL */}
       <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base font-semibold flex items-center gap-2">
-            <div className="w-3 h-3 rounded-full bg-[hsl(var(--chart-3))]"></div>
-            Seasonal Component
-          </CardTitle>
-          <CardDescription className="text-xs">
-            Repeating patterns and cycles
-          </CardDescription>
+        <CardHeader className="py-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Icons.waves className="h-4 w-4 text-muted-foreground" />
+              <CardTitle className="text-sm">Seasonal</CardTitle>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Max Var: ±
+              {Math.max(
+                Math.abs(stats.seasonal.min),
+                Math.abs(stats.seasonal.max),
+              ).toFixed(2)}{" "}
+              {unit}
+            </div>
+          </div>
         </CardHeader>
-        <CardContent>
-          <ChartContainer config={chartConfig} className="h-[220px] w-full">
+        <CardContent className="pb-4">
+          <ChartContainer
+            config={chartConfig}
+            style={{ height: "150px", width: "100%" }}
+          >
             <AreaChart
               data={chartData}
-              margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
+              syncId="decomposition-sync"
+              margin={{ top: 5, right: 10, left: 10, bottom: 0 }}
             >
-              <defs>
-                <linearGradient
-                  id={`gradient-seasonal-${param}`}
-                  x1="0"
-                  y1="0"
-                  x2="0"
-                  y2="1"
-                >
-                  <stop
-                    offset="0%"
-                    stopColor="hsl(var(--chart-3))"
-                    stopOpacity={0.4}
-                  />
-                  <stop
-                    offset="100%"
-                    stopColor="hsl(var(--chart-3))"
-                    stopOpacity={0.05}
-                  />
-                </linearGradient>
-              </defs>
-              <CartesianGrid
-                strokeDasharray="3 3"
-                vertical={false}
-                className="stroke-muted"
-              />
+              <CartesianGrid strokeDasharray="3 3" vertical={false} />
               <XAxis
                 dataKey="date"
                 tickLine={false}
                 axisLine={false}
                 tickMargin={8}
+                minTickGap={32}
                 interval={tickInterval}
-                className="text-xs"
-                tick={{ fill: "hsl(var(--muted-foreground))" }}
               />
               <YAxis
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
+                domain={["auto", "auto"]}
                 width={50}
-                className="text-xs"
-                tick={{ fill: "hsl(var(--muted-foreground))" }}
-                tickFormatter={(value) => value.toFixed(1)}
+                tickFormatter={(val) => `${val}${unit}`}
+                type="number"
+                allowDataOverflow
               />
               <ChartTooltip
-                cursor={{
-                  stroke: "hsl(var(--muted-foreground))",
-                  strokeWidth: 1,
-                }}
                 content={
                   <ChartTooltipContent
-                    formatter={(value) => [
-                      `${Number(value).toFixed(3)} ${unit}`,
-                      "Seasonal",
-                    ]}
-                    labelFormatter={(label, payload) => {
-                      if (payload?.[0]?.payload?.fullDate) {
-                        return payload[0].payload.fullDate;
-                      }
-                      return label;
-                    }}
+                    labelFormatter={(_, payload) =>
+                      payload[0]?.payload?.fullDate || ""
+                    }
                   />
                 }
               />
+              <ReferenceLine y={0} stroke="#666" strokeDasharray="3 3" />
               <Area
                 type="monotone"
                 dataKey="seasonal"
-                stroke="hsl(var(--chart-3))"
-                strokeWidth={2}
-                fill={`url(#gradient-seasonal-${param})`}
-                dot={false}
+                stroke="var(--color-seasonal)"
+                fill="var(--color-seasonal)"
+                fillOpacity={0.2}
+                isAnimationActive={false}
               />
             </AreaChart>
           </ChartContainer>
         </CardContent>
       </Card>
 
-      {/* Chart 4: Residual Component */}
+      {/* CHART 4: RESIDUAL */}
       <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base font-semibold flex items-center gap-2">
-            <div className="w-3 h-3 rounded-full bg-[hsl(var(--chart-4))]"></div>
-            Residual Component
-          </CardTitle>
-          <CardDescription className="text-xs">
-            Random variations and noise
-          </CardDescription>
+        <CardHeader className="py-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Icons.activity className="h-4 w-4 text-muted-foreground" />
+              <CardTitle className="text-sm">Residual</CardTitle>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Noise Bound: {stats.residual.min.toFixed(2)} to{" "}
+              {stats.residual.max.toFixed(2)}
+            </div>
+          </div>
         </CardHeader>
-        <CardContent>
-          <ChartContainer config={chartConfig} className="h-[220px] w-full">
-            <ScatterChart
+        <CardContent className="pb-4">
+          <ChartContainer
+            config={chartConfig}
+            style={{ height: "150px", width: "100%" }}
+          >
+            <LineChart
               data={chartData}
-              margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
+              syncId="decomposition-sync"
+              margin={{ top: 5, right: 10, left: 10, bottom: 0 }}
             >
-              <CartesianGrid
-                strokeDasharray="3 3"
-                vertical={false}
-                className="stroke-muted"
-              />
+              <CartesianGrid strokeDasharray="3 3" vertical={false} />
               <XAxis
                 dataKey="date"
                 tickLine={false}
                 axisLine={false}
                 tickMargin={8}
+                minTickGap={32}
                 interval={tickInterval}
-                className="text-xs"
-                tick={{ fill: "hsl(var(--muted-foreground))" }}
               />
               <YAxis
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
+                domain={["auto", "auto"]}
                 width={50}
-                className="text-xs"
-                tick={{ fill: "hsl(var(--muted-foreground))" }}
-                tickFormatter={(value) => value.toFixed(1)}
+                tickFormatter={(val) => `${val}${unit}`}
+                type="number"
+                allowDataOverflow
               />
               <ChartTooltip
-                cursor={{
-                  stroke: "hsl(var(--muted-foreground))",
-                  strokeWidth: 1,
-                }}
                 content={
                   <ChartTooltipContent
-                    formatter={(value) => [
-                      `${Number(value).toFixed(3)} ${unit}`,
-                      "Residual",
-                    ]}
-                    labelFormatter={(label, payload) => {
-                      if (payload?.[0]?.payload?.fullDate) {
-                        return payload[0].payload.fullDate;
-                      }
-                      return label;
-                    }}
+                    labelFormatter={(_, payload) =>
+                      payload[0]?.payload?.fullDate || ""
+                    }
                   />
                 }
               />
-              {/* Zero line reference */}
-              <ReferenceLine
-                y={0}
-                stroke="hsl(var(--muted-foreground))"
-                strokeWidth={1}
-                strokeDasharray="5 5"
-              />
-              <Scatter
+              <ReferenceLine y={0} stroke="#666" strokeDasharray="3 3" />
+              {/* Using Line with dot=true instead of Scatter for more reliable time-series plotting */}
+              <Line
+                type="monotone"
                 dataKey="residual"
-                fill="hsl(var(--chart-4))"
-                fillOpacity={0.7}
+                stroke="var(--color-residual)"
+                strokeWidth={0}
+                dot={{ r: 2, fill: "var(--color-residual)" }}
+                isAnimationActive={false}
               />
-            </ScatterChart>
+            </LineChart>
           </ChartContainer>
         </CardContent>
       </Card>
@@ -727,24 +581,36 @@ function ParameterDecompositionView({
 }
 
 export function DecompositionChart({
-  collectionName,
+  preprocessingId,
 }: DecompositionChartProps) {
-  // Get available parameters
-  const { data: availableParams, isLoading: isLoadingParams } = useQuery({
-    queryKey: ["decomposition-params", collectionName],
-    queryFn: () => GetAvailableDecompositionParameters(collectionName),
+  // PHASE 2: Fetch the entire decomposition report using the preprocessingId
+  const {
+    data: report,
+    isLoading,
+    error,
+  } = useQuery({
+    queryKey: ["decomposition-report", preprocessingId],
+    queryFn: () => getDecompositionByPreprocessingId(preprocessingId),
     refetchOnWindowFocus: false,
   });
 
-  if (isLoadingParams) {
+  if (isLoading) {
     return <LoadingSkeleton />;
   }
 
-  if (!availableParams || availableParams.length === 0) {
+  if (
+    error ||
+    !report ||
+    !report.parameters ||
+    Object.keys(report.parameters).length === 0
+  ) {
     return (
       <EmptyState message="Tidak ada data dekomposisi yang tersedia untuk dataset ini" />
     );
   }
+
+  // PHASE 2: Extract available parameters from the report keys
+  const availableParams = Object.keys(report.parameters);
 
   return (
     <div className="space-y-4">
@@ -753,8 +619,8 @@ export function DecompositionChart({
           Analisis Dekomposisi
         </h2>
         <p className="text-muted-foreground">
-          Visualisasi dekomposisi time series untuk memahami komponen trend,
-          seasonal, dan residual
+          Visualisasi dekomposisi time series untuk memahami tren, komponen
+          musiman (seasonal), dan residual.
         </p>
       </div>
 
@@ -771,11 +637,13 @@ export function DecompositionChart({
           ))}
         </TabsList>
 
+        {/* PHASE 2: Pass extracted data dynamically to the child view */}
         {availableParams.map((param) => (
           <TabsContent key={param} value={param} className="mt-0">
             <ParameterDecompositionView
               param={param}
-              collectionName={collectionName}
+              paramData={report.parameters[param]}
+              decompositionMethod={report.decomposition_method}
             />
           </TabsContent>
         ))}
