@@ -1,5 +1,5 @@
 "use client";
-import { GetComparisonData } from "@/lib/fetch/files.fetch";
+import { GetComparisonData, GetChartDataBySlug } from "@/lib/fetch/files.fetch";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { CartesianGrid, Line, LineChart, XAxis, YAxis, Brush } from "recharts";
@@ -27,6 +27,7 @@ import {
 import { Icons } from "@/app/dashboard/_components/icons";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import * as downsample from "downsample-lttb";
+import WindRoseChart from "./wind-rose-chart";
 
 //LTTB downsampling
 const TARGET_POINTS = 300;
@@ -67,6 +68,12 @@ const paramUnits: Record<string, string> = {
   WD10M: "°",
 };
 
+const windDirectionSpeedMap: Record<string, string> = {
+  WD10M: "WS10M",
+  DDD_CAR: "FF_AVG",
+  DDD_X: "FF_X",
+};
+
 export default function ComparisonChart({
   originalCollectionName,
   cleanedCollectionName,
@@ -88,6 +95,29 @@ export default function ComparisonChart({
     end: number;
   } | null>(null);
 
+  // State flags wind direction
+  const isWindDirection = Object.keys(windDirectionSpeedMap).includes(
+    selectedColumn,
+  );
+  const pairedSpeedColumn = isWindDirection
+    ? windDirectionSpeedMap[selectedColumn]
+    : null;
+
+  // Fetch full dataset when a wind parameter is selected
+  const { data: originalFullData, isLoading: isLoadingOriginal } = useQuery({
+    queryKey: ["chart-data", originalCollectionName],
+    queryFn: () => GetChartDataBySlug(originalCollectionName),
+    enabled: isWindDirection, // Only fetch if wind direction is selected
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const { data: cleanedFullData, isLoading: isLoadingCleaned } = useQuery({
+    queryKey: ["chart-data", cleanedCollectionName],
+    queryFn: () => GetChartDataBySlug(cleanedCollectionName),
+    enabled: isWindDirection, // Only fetch if wind direction is selected
+    staleTime: 5 * 60 * 1000,
+  });
+
   // Raw daily data preparation
   const rawDailyData = useMemo(() => {
     if (!data?.differences?.length || !selectedColumn) {
@@ -102,7 +132,12 @@ export default function ComparisonChart({
 
         // Ensure invalid values (8888/9999) break the line as null
         const isInvalid = (val: any) =>
-          val === 8888 || val === 9999 || val === null || val === undefined;
+          val === 8888 ||
+          val === 9999 ||
+          val === null ||
+          val === undefined ||
+          val === "None" ||
+          val === "NaN";
 
         return {
           dateTimestamp: dateObj.getTime(),
@@ -118,6 +153,8 @@ export default function ComparisonChart({
   }, [data?.differences, selectedColumn]);
 
   const lttbData = useMemo(() => {
+    // Bypass LTTB calculation entirely if it's a wind direction
+    if (isWindDirection) return [];
     if (!rawDailyData.length) return [];
 
     // If the data is already small, skip LTTB
@@ -188,7 +225,7 @@ export default function ComparisonChart({
         cleaned: cleanMatch !== undefined ? cleanMatch : null,
       } as RawDailyRecord;
     });
-  }, [rawDailyData]);
+  }, [rawDailyData, isWindDirection]);
 
   const displayData = useMemo(() => {
     // 1. If zoomed out entirely, return LTTB Overview
@@ -223,6 +260,62 @@ export default function ComparisonChart({
     ).length <= TARGET_POINTS;
 
   const chartData = lttbData;
+
+  // Data transformation for WindRoses
+  const windRoseDataSets = useMemo(() => {
+    if (!isWindDirection || !pairedSpeedColumn) {
+      return { original: [], cleaned: [] };
+    }
+
+    const original: any[] = [];
+    const cleaned: any[] = [];
+
+    const isInvalid = (val: any) =>
+      val === 8888 ||
+      val === 9999 ||
+      val === null ||
+      val === undefined ||
+      val === "None" ||
+      val === "NaN";
+
+    // 1. Extract original valid pairs from the full original dataset
+    if (originalFullData?.items) {
+      originalFullData.items.forEach((item: any) => {
+        const origDir = item[selectedColumn];
+        const origSpeed = item[pairedSpeedColumn];
+
+        if (!isInvalid(origDir) && !isInvalid(origSpeed)) {
+          original.push({
+            [selectedColumn]: origDir,
+            [pairedSpeedColumn]: origSpeed,
+          });
+        }
+      });
+    }
+
+    // 2. Extract cleaned valid pairs from the full cleaned dataset
+    if (cleanedFullData?.items) {
+      cleanedFullData.items.forEach((item: any) => {
+        const cleanDir = item[selectedColumn];
+        const cleanSpeed = item[pairedSpeedColumn];
+
+        if (!isInvalid(cleanDir) && !isInvalid(cleanSpeed)) {
+          cleaned.push({
+            [selectedColumn]: cleanDir,
+            [pairedSpeedColumn]: cleanSpeed,
+          });
+        }
+      });
+    }
+    return { original, cleaned };
+  }, [
+    originalFullData,
+    cleanedFullData,
+    isWindDirection,
+    selectedColumn,
+    pairedSpeedColumn,
+  ]);
+
   // Auto select first column when data loads
   useMemo(() => {
     if (data?.summary?.numericColumns?.length && !selectedColumn) {
@@ -230,8 +323,11 @@ export default function ComparisonChart({
     }
   }, [data, selectedColumn]);
 
+  const isAnyLoading =
+    isLoading || (isWindDirection && (isLoadingOriginal || isLoadingCleaned));
+
   // Loading state
-  if (isLoading) {
+  if (isAnyLoading) {
     return (
       <Card className="mt-6">
         <CardHeader>
@@ -338,134 +434,152 @@ export default function ComparisonChart({
       </CardHeader>
 
       <CardContent className="flex flex-col gap-2">
-        {/* Main Detail Chart */}
-        <ChartContainer config={chartConfig}>
-          {/* REMOVED syncId="compareChart" */}
-          <LineChart
-            accessibilityLayer
-            data={displayData}
-            margin={{ left: 12, right: 12, top: 10, bottom: 5 }}
-          >
-            <CartesianGrid vertical={false} strokeDasharray="3 3" />
-
-            <XAxis
-              dataKey="dateString"
-              tickLine={false}
-              axisLine={false}
-              tickMargin={8}
-              minTickGap={32}
-              tickFormatter={(value) => {
-                const date = new Date(value);
-
-                if (isDailyMode) {
-                  return date.toLocaleDateString("id-ID", {
-                    day: "numeric",
-                    month: "short",
-                    year: "2-digit",
-                  });
-                }
-
-                return date.toLocaleDateString("id-ID", {
-                  month: "short",
-                  year: "numeric",
-                });
-              }}
+        {/* Mengecek apakah parameter yang dipilih adalah arah angin dan memiliki pasangan kolom kecepatan */}
+        {isWindDirection && pairedSpeedColumn ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full">
+            <WindRoseChart
+              data={windRoseDataSets.original}
+              directionColumn={selectedColumn}
+              speedColumn={pairedSpeedColumn}
+              title="Dataset Original"
+              domainMax="auto"
             />
-
-            <YAxis
-              domain={["auto", "auto"]}
-              tickFormatter={(value) => {
-                const unit = paramUnits[selectedColumn] || "";
-                return `${value.toFixed(1)}${unit}`;
-              }}
+            <WindRoseChart
+              data={windRoseDataSets.cleaned}
+              directionColumn={selectedColumn}
+              speedColumn={pairedSpeedColumn}
+              title="Dataset Cleaned"
+              domainMax="auto"
             />
+          </div>
+        ) : (
+          <>
+            {/* Main Detail Chart (Line Chart untuk parameter non-angin) */}
+            <ChartContainer config={chartConfig}>
+              <LineChart
+                accessibilityLayer
+                data={displayData}
+                margin={{ left: 12, right: 12, top: 10, bottom: 5 }}
+              >
+                <CartesianGrid vertical={false} strokeDasharray="3 3" />
 
-            <ChartTooltip
-              cursor={{ strokeDasharray: "3 3" }}
-              content={
-                <ChartTooltipContent
-                  labelFormatter={(label) => {
-                    const date = new Date(label);
-                    const formattedDate = date.toLocaleDateString("id-ID", {
-                      day: "numeric",
-                      month: "long",
+                <XAxis
+                  dataKey="dateString"
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
+                  minTickGap={32}
+                  tickFormatter={(value) => {
+                    const date = new Date(value);
+                    if (isDailyMode) {
+                      return date.toLocaleDateString("id-ID", {
+                        day: "numeric",
+                        month: "short",
+                        year: "2-digit",
+                      });
+                    }
+                    return date.toLocaleDateString("id-ID", {
+                      month: "short",
                       year: "numeric",
                     });
-
-                    // Add suffix to inform user if the data is downsampled
-                    return isDailyMode
-                      ? formattedDate
-                      : `${formattedDate} (Estimasi Tren)`;
-                  }}
-                  formatter={(value, name) => {
-                    const unit = paramUnits[selectedColumn] || "";
-                    const labelName =
-                      name === "original" ? "Original" : "Cleaned";
-
-                    // Display exact value vs estimated notation
-                    const displayValue = isDailyMode
-                      ? `${Number(value).toFixed(2)} ${unit}`
-                      : `~${Number(value).toFixed(2)} ${unit}`;
-
-                    return [displayValue, labelName];
                   }}
                 />
-              }
-            />
 
-            {/* ORIGINAL LINE */}
-            <Line
-              dataKey="original"
-              type="monotone"
-              stroke="hsl(var(--chart-1))"
-              strokeWidth={1.5}
-              dot={false}
-              connectNulls
-            />
+                <YAxis
+                  domain={["auto", "auto"]}
+                  tickFormatter={(value) => {
+                    const unit = paramUnits[selectedColumn] || "";
+                    return `${value.toFixed(1)}${unit}`;
+                  }}
+                />
 
-            <Line
-              dataKey="cleaned"
-              type="monotone"
-              stroke="hsl(var(--chart-2))"
-              strokeWidth={1.5}
-              dot={false}
-              connectNulls
-            />
-          </LineChart>
-        </ChartContainer>
-        {/* Overview Chart with Brush (Fixed to LTTB data) */}
-        {lttbData.length > 0 && (
-          <ChartContainer
-            config={chartConfig}
-            style={{ minHeight: "80px", height: "80px" }}
-          >
-            {/* REMOVED syncId="compareChart" */}
-            <LineChart data={lttbData} margin={{ left: 12, right: 12 }}>
-              <Brush
-                dataKey="dateString"
-                height={30}
-                stroke="hsl(var(--primary))"
-                fill="hsl(var(--muted))"
-                tickFormatter={(val) => new Date(val).getFullYear().toString()}
-                onChange={(e) => {
-                  if (e.startIndex !== undefined && e.endIndex !== undefined) {
-                    if (
-                      e.startIndex === 0 &&
-                      e.endIndex === lttbData.length - 1
-                    ) {
-                      setBrushDomain(null);
-                    } else {
-                      const startTs = lttbData[e.startIndex]?.dateTimestamp;
-                      const endTs = lttbData[e.endIndex]?.dateTimestamp;
-                      if (startTs && endTs) {
-                        setBrushDomain({ start: startTs, end: endTs });
-                      }
-                    }
+                <ChartTooltip
+                  cursor={{ strokeDasharray: "3 3" }}
+                  content={
+                    <ChartTooltipContent
+                      labelFormatter={(label) => {
+                        const date = new Date(label);
+                        const formattedDate = date.toLocaleDateString("id-ID", {
+                          day: "numeric",
+                          month: "long",
+                          year: "numeric",
+                        });
+                        return isDailyMode
+                          ? formattedDate
+                          : `${formattedDate} (Estimasi Tren)`;
+                      }}
+                      formatter={(value, name) => {
+                        const unit = paramUnits[selectedColumn] || "";
+                        const labelName =
+                          name === "original" ? "Original" : "Cleaned";
+                        const displayValue = isDailyMode
+                          ? `${Number(value).toFixed(2)} ${unit}`
+                          : `~${Number(value).toFixed(2)} ${unit}`;
+                        return [displayValue, labelName];
+                      }}
+                    />
                   }
-                }}
-              />
-            </LineChart>
-          </ChartContainer>
+                />
+
+                <Line
+                  dataKey="original"
+                  type="monotone"
+                  stroke="hsl(var(--chart-1))"
+                  strokeWidth={1.5}
+                  dot={false}
+                  connectNulls
+                />
+
+                <Line
+                  dataKey="cleaned"
+                  type="monotone"
+                  stroke="hsl(var(--chart-2))"
+                  strokeWidth={1.5}
+                  dot={false}
+                  connectNulls
+                />
+              </LineChart>
+            </ChartContainer>
+
+            {/* Overview Chart with Brush (Mini chart untuk navigasi timeline) */}
+            {lttbData.length > 0 && (
+              <ChartContainer
+                config={chartConfig}
+                style={{ minHeight: "80px", height: "80px" }}
+              >
+                <LineChart data={lttbData} margin={{ left: 12, right: 12 }}>
+                  <Brush
+                    dataKey="dateString"
+                    height={30}
+                    stroke="hsl(var(--primary))"
+                    fill="hsl(var(--muted))"
+                    tickFormatter={(val) =>
+                      new Date(val).getFullYear().toString()
+                    }
+                    onChange={(e) => {
+                      if (
+                        e.startIndex !== undefined &&
+                        e.endIndex !== undefined
+                      ) {
+                        if (
+                          e.startIndex === 0 &&
+                          e.endIndex === lttbData.length - 1
+                        ) {
+                          setBrushDomain(null);
+                        } else {
+                          const startTs = lttbData[e.startIndex]?.dateTimestamp;
+                          const endTs = lttbData[e.endIndex]?.dateTimestamp;
+                          if (startTs && endTs) {
+                            setBrushDomain({ start: startTs, end: endTs });
+                          }
+                        }
+                      }
+                    }}
+                  />
+                </LineChart>
+              </ChartContainer>
+            )}
+          </>
         )}
       </CardContent>
     </Card>

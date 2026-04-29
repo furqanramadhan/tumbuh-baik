@@ -24,6 +24,8 @@ interface WindRoseChartProps {
   data: any[];
   directionColumn: string;
   speedColumn: string;
+  title?: string;
+  domainMax?: number | "auto";
 }
 
 // Custom tooltip function di-define di luar balutan tag JSX Tooltip content
@@ -62,6 +64,8 @@ export default function WindRoseChart({
   data,
   directionColumn,
   speedColumn,
+  title,
+  domainMax = "auto",
 }: WindRoseChartProps) {
   const [showPercentage, setShowPercentage] = useState(false);
 
@@ -74,7 +78,8 @@ export default function WindRoseChart({
 
   if (totalValid === 0) {
     return (
-      <div className="w-full h-[400px] flex items-center justify-center">
+      <div className="w-full h-[400px] flex flex-col items-center justify-center border rounded-lg bg-muted/10">
+        {title && <div className="font-semibold mb-4">{title}</div>}
         <div className="text-center space-y-2 text-sm text-muted-foreground">
           Data tidak cukup untuk Wind Rose
         </div>
@@ -85,7 +90,8 @@ export default function WindRoseChart({
   const stackedData = createCumulativeStacks(roseData);
 
   return (
-    <div className="w-full space-y-4">
+    <div className="w-full space-y-4 border rounded-lg p-4 bg-muted/5">
+      {title && <h3 className="font-semibold text-center text-lg">{title}</h3>}
       {/* Header Controls */}
       <div className="flex items-center justify-between">
         <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-muted/50 rounded-full text-xs">
@@ -178,9 +184,10 @@ export default function WindRoseChart({
               dataKey="direction"
               tick={{ fill: "hsl(var(--foreground))", fontSize: 12 }}
             />
+            {/* Apply dynamic domain */}
             <PolarRadiusAxis
               angle={30}
-              domain={[0, "auto"]}
+              domain={[0, domainMax]}
               tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 10 }}
             />
 
