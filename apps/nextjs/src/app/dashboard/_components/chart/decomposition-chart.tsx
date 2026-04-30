@@ -390,197 +390,197 @@ function ParameterDecompositionView({
         </CardContent>
       </Card>
 
-      {/* CHART 2: TREND */}
+      {/* DECOMPOSITION COMPONENTS */}
       <Card>
-        <CardHeader className="py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Icons.trendingUp className="h-4 w-4 text-muted-foreground" />
-              <CardTitle className="text-sm">Trend</CardTitle>
-            </div>
-            <div className="text-xs text-muted-foreground">
-              Min: {stats.trend.min.toFixed(2)} | Max:{" "}
-              {stats.trend.max.toFixed(2)}
-            </div>
-          </div>
+        <CardHeader className="py-4">
+          <CardTitle className="text-sm border-b pb-2 mb-2">Komponen Dekomposisi</CardTitle>
         </CardHeader>
-        <CardContent className="pb-4">
-          <ChartContainer
-            config={chartConfig}
-            style={{ height: "150px", width: "100%" }}
-          >
-            <LineChart
-              data={chartData}
-              syncId="decomposition-sync"
-              margin={{ top: 5, right: 10, left: 10, bottom: 0 }}
+        <CardContent className="pb-4 space-y-6">
+          {/* CHART 2: TREND */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <Icons.trendingUp className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm font-semibold">Trend</span>
+              </div>
+              <div className="text-xs text-muted-foreground">
+                Min: {stats.trend.min.toFixed(2)} | Max:{" "}
+                {stats.trend.max.toFixed(2)}
+              </div>
+            </div>
+            <ChartContainer
+              config={chartConfig}
+              style={{ height: "150px", width: "100%" }}
             >
-              <CartesianGrid strokeDasharray="3 3" vertical={false} />
-              <XAxis
-                dataKey="date"
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
-                minTickGap={32}
-                interval={tickInterval}
-              />
-              <YAxis
-                domain={["auto", "auto"]}
-                width={50}
-                tickFormatter={(val) => `${val}${unit}`}
-                type="number"
-                allowDataOverflow
-              />
-              <ChartTooltip
-                content={
-                  <ChartTooltipContent
-                    labelFormatter={(_, payload) =>
-                      payload[0]?.payload?.fullDate || ""
-                    }
-                  />
-                }
-              />
-              <Line
-                type="monotone"
-                dataKey="trend"
-                stroke="hsl(var(--chart-2))"
-                strokeWidth={2.5}
-                dot={false}
-                isAnimationActive={false}
-              />
-            </LineChart>
-          </ChartContainer>
-        </CardContent>
-      </Card>
+              <LineChart
+                data={chartData}
+                syncId="decomposition-sync"
+                margin={{ top: 5, right: 10, left: 10, bottom: 0 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis
+                  dataKey="date"
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
+                  minTickGap={32}
+                  interval={tickInterval}
+                />
+                <YAxis
+                  domain={["auto", "auto"]}
+                  width={50}
+                  tickFormatter={(val) => `${val}${unit}`}
+                  type="number"
+                  allowDataOverflow
+                />
+                <ChartTooltip
+                  content={
+                    <ChartTooltipContent
+                      labelFormatter={(_, payload) =>
+                        payload[0]?.payload?.fullDate || ""
+                      }
+                    />
+                  }
+                />
+                <Line
+                  type="monotone"
+                  dataKey="trend"
+                  stroke="hsl(var(--chart-2))"
+                  strokeWidth={2.5}
+                  dot={false}
+                  isAnimationActive={false}
+                />
+              </LineChart>
+            </ChartContainer>
+          </div>
 
-      {/* CHART 3: SEASONAL */}
-      <Card>
-        <CardHeader className="py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Icons.waves className="h-4 w-4 text-muted-foreground" />
-              <CardTitle className="text-sm">Seasonal</CardTitle>
-            </div>
-            <div className="text-xs text-muted-foreground">
-              Max Var: ±
-              {Math.max(
-                Math.abs(stats.seasonal.min),
-                Math.abs(stats.seasonal.max),
-              ).toFixed(2)}{" "}
-              {unit}
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="pb-4">
-          <ChartContainer
-            config={chartConfig}
-            style={{ height: "150px", width: "100%" }}
-          >
-            <AreaChart
-              data={chartData}
-              syncId="decomposition-sync"
-              margin={{ top: 5, right: 10, left: 10, bottom: 0 }}
-            >
-              <CartesianGrid strokeDasharray="3 3" vertical={false} />
-              <XAxis
-                dataKey="date"
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
-                minTickGap={32}
-                interval={tickInterval}
-              />
-              <YAxis
-                domain={["auto", "auto"]}
-                width={50}
-                tickFormatter={(val) => `${val}${unit}`}
-                type="number"
-                allowDataOverflow
-              />
-              <ChartTooltip
-                content={
-                  <ChartTooltipContent
-                    labelFormatter={(_, payload) =>
-                      payload[0]?.payload?.fullDate || ""
-                    }
-                  />
-                }
-              />
-              <ReferenceLine y={0} stroke="#666" strokeDasharray="3 3" />
-              <Area
-                type="monotone"
-                dataKey="seasonal"
-                stroke="hsl(var(--chart-3))"
-                fill="hsl(var(--chart-3))"
-                fillOpacity={0.3}
-                strokeWidth={2}
-                isAnimationActive={false}
-              />
-            </AreaChart>
-          </ChartContainer>
-        </CardContent>
-      </Card>
+          <div className="border-t border-border" />
 
-      {/* CHART 4: RESIDUAL */}
-      <Card>
-        <CardHeader className="py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Icons.activity className="h-4 w-4 text-muted-foreground" />
-              <CardTitle className="text-sm">Residual</CardTitle>
+          {/* CHART 3: SEASONAL */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <Icons.waves className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm font-semibold">Seasonal</span>
+              </div>
+              <div className="text-xs text-muted-foreground">
+                Max Var: ±
+                {Math.max(
+                  Math.abs(stats.seasonal.min),
+                  Math.abs(stats.seasonal.max),
+                ).toFixed(2)}{" "}
+                {unit}
+              </div>
             </div>
-            <div className="text-xs text-muted-foreground">
-              Noise Bound: {stats.residual.min.toFixed(2)} to{" "}
-              {stats.residual.max.toFixed(2)}
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="pb-4">
-          <ChartContainer
-            config={chartConfig}
-            style={{ height: "150px", width: "100%" }}
-          >
-            <LineChart
-              data={chartData}
-              syncId="decomposition-sync"
-              margin={{ top: 5, right: 10, left: 10, bottom: 0 }}
+            <ChartContainer
+              config={chartConfig}
+              style={{ height: "150px", width: "100%" }}
             >
-              <CartesianGrid strokeDasharray="3 3" vertical={false} />
-              <XAxis
-                dataKey="date"
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
-                minTickGap={32}
-                interval={tickInterval}
-              />
-              <YAxis
-                domain={["auto", "auto"]}
-                width={50}
-                tickFormatter={(val) => `${val}${unit}`}
-                type="number"
-                allowDataOverflow
-              />
-              <ChartTooltip
-                content={
-                  <ChartTooltipContent
-                    labelFormatter={(_, payload) =>
-                      payload[0]?.payload?.fullDate || ""
-                    }
-                  />
-                }
-              />
-              <ReferenceLine y={0} stroke="#666" strokeDasharray="3 3" />
-              {/* Using Line with dot=true instead of Scatter for more reliable time-series plotting */}
-              <Line
-                type="monotone"
-                dataKey="residual"
-                stroke="hsl(var(--chart-4))"
-                strokeWidth={0}
-                dot={{ r: 3, fill: "hsl(var(--chart-4))" }}
-                isAnimationActive={false}
-              />
-            </LineChart>
-          </ChartContainer>
+              <AreaChart
+                data={chartData}
+                syncId="decomposition-sync"
+                margin={{ top: 5, right: 10, left: 10, bottom: 0 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis
+                  dataKey="date"
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
+                  minTickGap={32}
+                  interval={tickInterval}
+                />
+                <YAxis
+                  domain={["auto", "auto"]}
+                  width={50}
+                  tickFormatter={(val) => `${val}${unit}`}
+                  type="number"
+                  allowDataOverflow
+                />
+                <ChartTooltip
+                  content={
+                    <ChartTooltipContent
+                      labelFormatter={(_, payload) =>
+                        payload[0]?.payload?.fullDate || ""
+                      }
+                    />
+                  }
+                />
+                <ReferenceLine y={0} stroke="#666" strokeDasharray="3 3" />
+                <Area
+                  type="monotone"
+                  dataKey="seasonal"
+                  stroke="hsl(var(--chart-3))"
+                  fill="hsl(var(--chart-3))"
+                  fillOpacity={0.3}
+                  strokeWidth={2}
+                  isAnimationActive={false}
+                />
+              </AreaChart>
+            </ChartContainer>
+          </div>
+
+          <div className="border-t border-border" />
+
+          {/* CHART 4: RESIDUAL */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <Icons.activity className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm font-semibold">Residual</span>
+              </div>
+              <div className="text-xs text-muted-foreground">
+                Noise Bound: {stats.residual.min.toFixed(2)} to{" "}
+                {stats.residual.max.toFixed(2)}
+              </div>
+            </div>
+            <ChartContainer
+              config={chartConfig}
+              style={{ height: "150px", width: "100%" }}
+            >
+              <LineChart
+                data={chartData}
+                syncId="decomposition-sync"
+                margin={{ top: 5, right: 10, left: 10, bottom: 0 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis
+                  dataKey="date"
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
+                  minTickGap={32}
+                  interval={tickInterval}
+                />
+                <YAxis
+                  domain={["auto", "auto"]}
+                  width={50}
+                  tickFormatter={(val) => `${val}${unit}`}
+                  type="number"
+                  allowDataOverflow
+                />
+                <ChartTooltip
+                  content={
+                    <ChartTooltipContent
+                      labelFormatter={(_, payload) =>
+                        payload[0]?.payload?.fullDate || ""
+                      }
+                    />
+                  }
+                />
+                <ReferenceLine y={0} stroke="#666" strokeDasharray="3 3" />
+                {/* Using Line with dot=true instead of Scatter for more reliable time-series plotting */}
+                <Line
+                  type="monotone"
+                  dataKey="residual"
+                  stroke="hsl(var(--chart-4))"
+                  strokeWidth={0}
+                  dot={{ r: 3, fill: "hsl(var(--chart-4))" }}
+                  isAnimationActive={false}
+                />
+              </LineChart>
+            </ChartContainer>
+          </div>
         </CardContent>
       </Card>
     </div>
