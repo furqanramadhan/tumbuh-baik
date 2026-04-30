@@ -26,13 +26,19 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Icons } from "@/app/dashboard/_components/icons";
 import { getDecompositionByPreprocessingId } from "@/lib/fetch/files.fetch";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
 interface ChartDataPoint {
   date: string;
@@ -374,8 +380,8 @@ function ParameterDecompositionView({
               <Line
                 type="monotone"
                 dataKey="original"
-                stroke="var(--color-original)"
-                strokeWidth={1}
+                stroke="hsl(var(--chart-1))"
+                strokeWidth={2}
                 dot={false}
                 isAnimationActive={false}
               />
@@ -436,8 +442,8 @@ function ParameterDecompositionView({
               <Line
                 type="monotone"
                 dataKey="trend"
-                stroke="var(--color-trend)"
-                strokeWidth={1.5}
+                stroke="hsl(var(--chart-2))"
+                strokeWidth={2.5}
                 dot={false}
                 isAnimationActive={false}
               />
@@ -503,9 +509,10 @@ function ParameterDecompositionView({
               <Area
                 type="monotone"
                 dataKey="seasonal"
-                stroke="var(--color-seasonal)"
-                fill="var(--color-seasonal)"
-                fillOpacity={0.2}
+                stroke="hsl(var(--chart-3))"
+                fill="hsl(var(--chart-3))"
+                fillOpacity={0.3}
+                strokeWidth={2}
                 isAnimationActive={false}
               />
             </AreaChart>
@@ -567,9 +574,9 @@ function ParameterDecompositionView({
               <Line
                 type="monotone"
                 dataKey="residual"
-                stroke="var(--color-residual)"
+                stroke="hsl(var(--chart-4))"
                 strokeWidth={0}
-                dot={{ r: 2, fill: "var(--color-residual)" }}
+                dot={{ r: 3, fill: "hsl(var(--chart-4))" }}
                 isAnimationActive={false}
               />
             </LineChart>
@@ -583,7 +590,9 @@ function ParameterDecompositionView({
 export function DecompositionChart({
   preprocessingId,
 }: DecompositionChartProps) {
+  const [selectedParam, setSelectedParam] = useState<string>("");
   // PHASE 2: Fetch the entire decomposition report using the preprocessingId
+
   const {
     data: report,
     isLoading,
@@ -611,6 +620,7 @@ export function DecompositionChart({
 
   // PHASE 2: Extract available parameters from the report keys
   const availableParams = Object.keys(report.parameters);
+  const activeParam = selectedParam || availableParams[0]; // Default to first param if none selected
 
   return (
     <div className="space-y-4">
@@ -624,30 +634,33 @@ export function DecompositionChart({
         </p>
       </div>
 
-      <Tabs defaultValue={availableParams[0]} className="w-full">
-        <TabsList className="mb-4 flex-wrap h-auto gap-2 bg-transparent p-0">
-          {availableParams.map((param) => (
-            <TabsTrigger
-              key={param}
-              value={param}
-              className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground rounded-lg px-4 py-2 border"
-            >
-              {getParamLabel(param)}
-            </TabsTrigger>
-          ))}
-        </TabsList>
+      <div className="flex flex-col gap-6 pt-2">
+        <div className="flex justify-start sm:justify-end">
+          <Select value={activeParam} onValueChange={setSelectedParam}>
+            <SelectTrigger className="w-full sm:w-[250px]">
+              <SelectValue placeholder="Pilih parameter" />
+            </SelectTrigger>
+            <SelectContent>
+              {availableParams.map((param) => (
+                <SelectItem key={param} value={param}>
+                  <div className="flex items-center justify-between gap-2">
+                    <span>{getParamLabel(param)}</span>
+                    <span className="text-xs text-muted-foreground">
+                      ({param})
+                    </span>
+                  </div>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
 
-        {/* PHASE 2: Pass extracted data dynamically to the child view */}
-        {availableParams.map((param) => (
-          <TabsContent key={param} value={param} className="mt-0">
-            <ParameterDecompositionView
-              param={param}
-              paramData={report.parameters[param]}
-              decompositionMethod={report.decomposition_method}
-            />
-          </TabsContent>
-        ))}
-      </Tabs>
+        <ParameterDecompositionView
+          param={activeParam}
+          paramData={report.parameters[activeParam]}
+          decompositionMethod={report.decomposition_method}
+        />
+      </div>
     </div>
   );
 }
