@@ -29,9 +29,8 @@ const nextConfig: NextConfig = {
       "@radix-ui/react-icons",
       "date-fns",
     ],
-    // @ts-ignore: Ketersediaan allowedDevOrigins mungkin berbeda di rilis tertentu
-    allowedDevOrigins: ["192.168.1.2", "localhost:3000"],
   },
+
   // Production optimizations
   productionBrowserSourceMaps: false,
   poweredByHeader: false,
