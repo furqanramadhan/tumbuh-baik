@@ -19,3 +19,5 @@ docker-compose.override.yml
 PENJELASAN.txt
 
 apps/flask/PENJELASAN.txt
+node_modules/
+**/node_modules/
