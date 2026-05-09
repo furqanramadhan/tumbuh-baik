@@ -38,7 +38,8 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Icons } from "@/app/dashboard/_components/icons";
 import { getDecompositionByPreprocessingId } from "@/lib/fetch/files.fetch";
-import { useMemo, useState } from "react";
+import { useMemo, useState, useTransition } from "react";
+import * as downsample from "downsample-lttb";
 
 interface ChartDataPoint {
   date: number;
@@ -217,12 +218,10 @@ function ParameterDecompositionView({
   const chartData: ChartDataPoint[] = useMemo(() => {
     if (!paramData?.data || !Array.isArray(paramData.data)) return [];
 
-    return paramData.data.map((item: any) => {
-      // Unwrapping MongoDB $date if present, else fallback to standard string
+    // 1. Map all data points first
+    const fullData: ChartDataPoint[] = paramData.data.map((item: any) => {
       const rawDate = item.Date?.$date || item.Date;
       const dateObj = new Date(rawDate);
-
-      // Using Date.UTC to get the exact midnight timestamp without timezone offsets
       const startOfDayUTC = Date.UTC(
         dateObj.getUTCFullYear(),
         dateObj.getUTCMonth(),
@@ -244,9 +243,39 @@ function ParameterDecompositionView({
         year: dateObj.getFullYear(),
       };
     });
+
+    // 2. Determine if we need to downsample
+    const TARGET_RESOLUTION = 500;
+    if (fullData.length <= TARGET_RESOLUTION) {
+      return fullData;
+    }
+
+    // 3. Prepare data for LTTB
+    // FIX: explicitly type 'd' as ChartDataPoint
+    const lttbInput: [number, number][] = fullData.map((d: ChartDataPoint) => [
+      d.date,
+      d.original ?? 0,
+    ]);
+
+    // 4. Run LTTB algorithm
+    const downsampledPairs = downsample.processData(
+      lttbInput,
+      TARGET_RESOLUTION,
+    );
+
+    // 5. Create a Set of timestamps for O(1) fast lookup
+    // FIX: explicitly type 'pair' as [number, number]
+    const preservedTimestamps = new Set(
+      downsampledPairs.map((pair: [number, number]) => pair[0]),
+    );
+
+    // 6. Filter the full dataset
+    // FIX: explicitly type 'd' as ChartDataPoint
+    return fullData.filter((d: ChartDataPoint) =>
+      preservedTimestamps.has(d.date),
+    );
   }, [paramData]);
 
-  // Calculate stats for min/max  boundaries
   const stats = useMemo<DecompositionStats | null>(() => {
     if (!chartData.length) return null;
 
@@ -622,8 +651,9 @@ export function DecompositionChart({
   preprocessingId,
 }: DecompositionChartProps) {
   const [selectedParam, setSelectedParam] = useState<string>("");
-  // PHASE 2: Fetch the entire decomposition report using the preprocessingId
+  const [isPending, startTransition] = useTransition(); // Add this
 
+  // PHASE 2: Fetch the entire decomposition report using the preprocessingId
   const {
     data: report,
     isLoading,
@@ -651,7 +681,7 @@ export function DecompositionChart({
 
   // PHASE 2: Extract available parameters from the report keys
   const availableParams = Object.keys(report.parameters);
-  const activeParam = selectedParam || availableParams[0]; // Default to first param if none selected
+  const activeParam = selectedParam || availableParams[0];
 
   return (
     <div className="space-y-4">
@@ -667,7 +697,13 @@ export function DecompositionChart({
 
       <div className="flex flex-col gap-6 pt-2">
         <div className="flex justify-start sm:justify-end">
-          <Select value={activeParam} onValueChange={setSelectedParam}>
+          {/* Use startTransition here */}
+          <Select
+            value={activeParam}
+            onValueChange={(val) =>
+              startTransition(() => setSelectedParam(val))
+            }
+          >
             <SelectTrigger className="w-full sm:w-[250px]">
               <SelectValue placeholder="Pilih parameter" />
             </SelectTrigger>
@@ -686,11 +722,17 @@ export function DecompositionChart({
           </Select>
         </div>
 
-        <ParameterDecompositionView
-          param={activeParam}
-          paramData={report.parameters[activeParam]}
-          decompositionMethod={report.decomposition_method}
-        />
+        <div
+          className={
+            isPending ? "opacity-50 transition-opacity" : "transition-opacity"
+          }
+        >
+          <ParameterDecompositionView
+            param={activeParam}
+            paramData={report.parameters[activeParam]}
+            decompositionMethod={report.decomposition_method}
+          />
+        </div>
       </div>
     </div>
   );
