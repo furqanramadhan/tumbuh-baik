@@ -54,8 +54,13 @@ app = Flask(__name__)
 cors_origins = os.getenv("CORS_ORIGINS", "").split(",")
 CORS(app, 
      origins=cors_origins,
-     supports_credentials=True,   # 🔥 Kunci: izinkan kirim cookie
-     allow_headers=["Content-Type", "Authorization", "Cookie"],
+     supports_credentials=True,
+     allow_headers=[
+         "Content-Type",
+         "Authorization",
+         "Cookie",
+         "ngrok-skip-browser-warning",
+     ],
      expose_headers=["Content-Type"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
