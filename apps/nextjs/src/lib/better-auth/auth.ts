@@ -23,8 +23,8 @@ export const auth = betterAuth({
 
   trustedOrigins: [
     "https://zonapetik.site",
-    "https://www.zonapetik.site",
     "https://backed-octagon-levitate.ngrok-free.dev",
+    "http://localhost:3000",
   ],
 
   session: {
