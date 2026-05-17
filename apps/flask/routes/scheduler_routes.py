@@ -111,14 +111,12 @@ def get_status():
         
         if config and config.get("enabled") is True:
             is_active = True
-            # Gunakan helper yang baru dibuat di Phase 4.5
             computed_runs = calculate_next_runs(
                 config.get("frequency", "weekly"),
                 config.get("executionTime", "02:00"),
                 config.get("dayOfWeek", 0),
                 config.get("daysOfWeek"),
-                config.get("daysOfMonth"),
-                1
+                count=1
             )
             next_run = computed_runs[0] if computed_runs else None
         else:
@@ -182,13 +180,19 @@ def get_logs():
         return jsonify({"success": False, "error": {"code": "INTERNAL_ERROR"}}), 500
     
 
-def calculate_next_runs(frequency, exec_time, day_of_week=0, days_of_week=None, days_of_month=None, count=5):
-    """Simple calculation for next runs in UTC based on WIB time (UTC+7)"""
+def calculate_next_runs(
+    frequency,
+    exec_time, 
+    day_of_week=0,
+    days_of_week=None,
+    count=6
+):
+    """Simple calculation for next runs UTC based on UTC+7 """
     try:
         hour, minute = map(int, exec_time.split(':'))
-    except:
+    except: 
         hour, minute = 2, 0
-        
+    
     now = datetime.now(timezone.utc)
     runs = []
     
@@ -201,23 +205,19 @@ def calculate_next_runs(frequency, exec_time, day_of_week=0, days_of_week=None, 
     while len(runs) < count:
         # Konversi format hari Python ke format JavaScript (Minggu=0, Senin=1, dst)
         js_weekday = (date_cursor.weekday() + 1) % 7
-        
         if frequency == "weekly" and js_weekday != day_of_week:
             date_cursor += timedelta(days=1)
             continue
         elif frequency == "biweekly" and days_of_week and js_weekday not in days_of_week:
             date_cursor += timedelta(days=1)
             continue
-        elif frequency == "monthly" and days_of_month and date_cursor.day not in days_of_month:
-            date_cursor += timedelta(days=1)
-            continue
-            
         utc_run = date_cursor - timedelta(hours=7)
         runs.append(utc_run.isoformat())
         date_cursor += timedelta(days=1)
         
     return runs
-
+    
+    
 @scheduler_bp.route("/config", methods=["GET"])
 # @require_auth, matikan sementara untuk demo
 def get_automation_config():
@@ -232,7 +232,6 @@ def get_automation_config():
                 "executionTime": "02:00",
                 "dayOfWeek": 0,
                 "daysOfWeek": [0, 3],
-                "daysOfMonth": [1, 15],
                 "selectedDatasets": {"nasa_refresh": [], "nasa_preprocess": [], "bmkg_preprocess": []}
             }
         else:
@@ -242,14 +241,14 @@ def get_automation_config():
             config.get("frequency", "weekly"),
             config.get("executionTime", "02:00"),
             config.get("dayOfWeek", 0),
-            config.get("daysOfWeek"),
-            config.get("daysOfMonth")
+            config.get("daysOfWeek")
         ) if config.get("enabled", False) else []
             
         return jsonify({"success": True, "data": config})
     except Exception as e:
         logger.error(f"Error getting config: {e}")
         return jsonify({"success": False, "error": {"code": "INTERNAL_ERROR"}}), 500
+
 
 @scheduler_bp.route("/config", methods=["POST"])
 # @require_auth, matikan sementara untuk demo
@@ -259,7 +258,7 @@ def save_automation_config():
         db = SchedulerLog._get_db()
         
         # Validasi dasar
-        if body.get("frequency") not in ["weekly", "biweekly", "monthly"]:
+        if body.get("frequency") not in ["weekly", "biweekly"]:
             return jsonify({"success": False, "error": {"message": "Invalid frequency"}}), 400
             
         update_data = {
@@ -268,16 +267,15 @@ def save_automation_config():
             "executionTime": body.get("executionTime", "02:00"),
             "dayOfWeek": body.get("dayOfWeek", 0),
             "daysOfWeek": body.get("daysOfWeek", [0, 3]),
-            "daysOfMonth": body.get("daysOfMonth", [1, 15]),
             "selectedDatasets": body.get("selectedDatasets", {"nasa_refresh": [], "nasa_preprocess": [], "bmkg_preprocess": []}),
             "updatedAt": datetime.now(timezone.utc)
         }
         
-        db.scheduler_config.update_one({}, {"$set": update_data, "$unset": {"lastTriggeredDate": ""}}, upsert=True)
+        db.scheduler_config.update_one({}, {"$set": update_data, "$unset": {"lastTriggeredDate": "", "daysOfMonth": ""}}, upsert=True)
         
         next_run = calculate_next_runs(
             update_data["frequency"], update_data["executionTime"], 
-            update_data["dayOfWeek"], update_data["daysOfWeek"], update_data["daysOfMonth"], 1
+            update_data["dayOfWeek"], update_data["daysOfWeek"], count=1
         )
         
         return jsonify({"success": True, "message": "Config saved", "data": {"nextRun": next_run[0] if next_run else None}})
@@ -375,8 +373,6 @@ def scheduler_daemon():
                 if freq == "weekly" and js_weekday == config.get("dayOfWeek", 0):
                     is_today = True
                 elif freq == "biweekly" and js_weekday in config.get("daysOfWeek", []):
-                    is_today = True
-                elif freq == "monthly" and now_wib.day in config.get("daysOfMonth", []):
                     is_today = True
 
                 # Trigger if day and exact minute matches

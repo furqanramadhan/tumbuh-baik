@@ -28,13 +28,10 @@ export default function AutomationConfig() {
 
   // Form states
   const [enabled, setEnabled] = useState(false);
-  const [frequency, setFrequency] = useState<"weekly" | "biweekly" | "monthly">(
-    "weekly",
-  );
+  const [frequency, setFrequency] = useState<"weekly" | "biweekly">("weekly");
   const [executionTime, setExecutionTime] = useState("02:00");
   const [dayOfWeek, setDayOfWeek] = useState(0);
   const [daysOfWeek, setDaysOfWeek] = useState<number[]>([0, 3]);
-  const [daysOfMonth, setDaysOfMonth] = useState<number[]>([1, 15]);
   const [selectedDatasets, setSelectedDatasets] = useState<{
     nasa_refresh: string[];
     nasa_preprocess: string[];
@@ -73,15 +70,11 @@ export default function AutomationConfig() {
         cursor.setDate(cursor.getDate() + 1);
         continue;
       }
-      if (frequency === "monthly" && !daysOfMonth.includes(cursor.getDate())) {
-        cursor.setDate(cursor.getDate() + 1);
-        continue;
-      }
       runs.push(cursor.toISOString());
       cursor.setDate(cursor.getDate() + 1);
     }
     setNextRunsPreview(runs);
-  }, [enabled, frequency, executionTime, dayOfWeek, daysOfWeek, daysOfMonth]);
+  }, [enabled, frequency, executionTime, dayOfWeek, daysOfWeek]);
 
   const loadData = async () => {
     try {
@@ -96,7 +89,6 @@ export default function AutomationConfig() {
       setExecutionTime(config.executionTime || "02:00");
       setDayOfWeek(config.dayOfWeek || 0);
       setDaysOfWeek(config.daysOfWeek || [0, 3]);
-      setDaysOfMonth(config.daysOfMonth || [1, 15]);
       setSelectedDatasets(
         config.selectedDatasets || {
           nasa_refresh: [],
@@ -130,14 +122,6 @@ export default function AutomationConfig() {
         );
       }
       if (
-        frequency === "monthly" &&
-        (daysOfMonth.length === 0 || daysOfMonth.length > 6)
-      ) {
-        return toast.error(
-          "Please select between 1-6 dates for monthly schedule.",
-        );
-      }
-      if (
         selectedDatasets.nasa_refresh.length === 0 &&
         selectedDatasets.nasa_preprocess.length === 0 &&
         selectedDatasets.bmkg_preprocess.length === 0
@@ -154,7 +138,6 @@ export default function AutomationConfig() {
         executionTime,
         dayOfWeek,
         daysOfWeek,
-        daysOfMonth,
         selectedDatasets,
       });
       toast.success("Automation configuration saved successfully");
@@ -251,7 +234,6 @@ export default function AutomationConfig() {
             >
               <option value="weekly">Weekly (1x / week)</option>
               <option value="biweekly">Bi-weekly (2x / week)</option>
-              <option value="monthly">Monthly (Dates)</option>
             </select>
           </div>
 
@@ -331,26 +313,6 @@ export default function AutomationConfig() {
                     type="button"
                     onClick={() => toggleArrayItem(setDaysOfWeek, i)}
                     className={`px-3 py-1 text-sm rounded ${daysOfWeek.includes(i) ? "bg-blue-100 text-blue-700 border border-blue-300" : "bg-gray-100 text-gray-600 border border-gray-200"}`}
-                  >
-                    {d}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {frequency === "monthly" && (
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Run on dates (Select max 6)
-              </label>
-              <div className="grid grid-cols-7 gap-1">
-                {Array.from({ length: 31 }, (_, i) => i + 1).map((d) => (
-                  <button
-                    key={d}
-                    type="button"
-                    onClick={() => toggleArrayItem(setDaysOfMonth, d)}
-                    className={`p-1 text-sm rounded text-center ${daysOfMonth.includes(d) ? "bg-blue-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
                   >
                     {d}
                   </button>
@@ -485,9 +447,6 @@ export default function AutomationConfig() {
               </li>
               <li>
                 <b>Bi-weekly:</b> Balanced between freshness & server load.
-              </li>
-              <li>
-                <b>Monthly:</b> Suggested for massive historical datasets.
               </li>
             </ul>
             <p className="mt-3 text-orange-700 italic text-xs">
