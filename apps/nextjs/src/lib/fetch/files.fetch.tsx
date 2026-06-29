@@ -675,10 +675,8 @@ export const triggerForecastRun = async () => {
 
 export const triggerLSTMForecast = async () => {
   try {
-    const baseUrl = getBaseUrl();
-    const apiUrl =
-      baseUrl === "" ? "https://lstm.zonapetik.site" : `${baseUrl}/lstm`;
-    const res = await axios.post(`${apiUrl}/run-lstm`);
+    const res = await axios.post(`${FLASK_API_URL}/run-lstm`);
+    return res.data;
   } catch (error) {
     console.error("Trigger LSTM forecast failed:", error);
     throw error;

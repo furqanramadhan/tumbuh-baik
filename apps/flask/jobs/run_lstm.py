@@ -48,7 +48,6 @@ def run_lstm_from_config():
         # Kosongkan collection temp-lstm dan decompose di awal
         db["temp-lstm"].delete_many({})
         db["decompose-lstm-temp"].delete_many({})  # ✅ TAMBAH
-        db["decompose-lstm"].delete_many({})       # ✅ TAMBAH
 
         config = db.lstm_configs.find_one_and_update(
             {"status": "pending"},
@@ -60,9 +59,6 @@ def run_lstm_from_config():
             return jsonify({"message": "No pending LSTM config found."}), 404
 
         config_id = str(config["_id"])
-        
-        # Kosongkan collection lstm-forecast di awal
-        db["lstm-forecast"].delete_many({})
         
         # Ambil info kolom yang akan dianalisis
         name = config.get("name", f"lstm_forecast_{int(time.time())}")
@@ -130,20 +126,25 @@ def run_lstm_from_config():
                 )
                 results.append(result)
 
+                if result.get("status") == "error":
+                    raise ValueError(result.get("error", "Unknown LSTM error"))
+
                 # Simpan metrik evaluasi untuk kolom ini
                 if result.get("error_metrics"):
+                    metrics = result["error_metrics"]
                     error_metrics_list.append({
                         "collectionName": collection,
                         "columnName": column,
                         "metrics_lstm": {
-                            "mae": result["error_metrics"].get("mae"),
-                            "mse": result["error_metrics"].get("mse"),
-                            "rmse": result["error_metrics"].get("rmse"),
-                            "mape": result["error_metrics"].get("mape"),  # ✅ Ganti ke sMAPE
-                            "mad": result["error_metrics"].get("mad"),
-                            "aic": result["error_metrics"].get("aic"),
-                            "val_size": result["error_metrics"].get("val_size"),
-                            "num_params": result["error_metrics"].get("num_params"),
+                            "mae": metrics.get("mae"),
+                            "mse": metrics.get("mse"),
+                            "rmse": metrics.get("rmse"),
+                            "mape": metrics.get("mape"),
+                            "r2": metrics.get("r2"),
+                            "directional_accuracy": metrics.get("directional_accuracy"),
+                            "recursive_mae": metrics.get("recursive_mae"),
+                            "recursive_rmse": metrics.get("recursive_rmse"),
+                            "recursive_mape": metrics.get("recursive_mape"),
                         }
                     })
                 

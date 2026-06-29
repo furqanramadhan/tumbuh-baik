@@ -11,6 +11,7 @@ import itertools
 import warnings
 import random
 import gc
+import os
 # Import library seasonal decompose
 from statsmodels.tsa.seasonal import seasonal_decompose
 
@@ -43,15 +44,61 @@ print(f"🔥 Using device: {device}")
 # Global Configuration
 # ======================================================
 TRAIN_SPLIT_RATIO = 0.8
+FAST_MODE = os.getenv("LSTM_FAST_MODE", "1").lower() in ["1", "true", "yes", "on"]
+GRID_EPOCHS = int(os.getenv("LSTM_GRID_EPOCHS", "15" if FAST_MODE else "50"))
+FINAL_EPOCHS = int(os.getenv("LSTM_FINAL_EPOCHS", "30" if FAST_MODE else "100"))
+GRID_PATIENCE = int(os.getenv("LSTM_GRID_PATIENCE", "5" if FAST_MODE else "15"))
+FINAL_PATIENCE = int(os.getenv("LSTM_FINAL_PATIENCE", "8" if FAST_MODE else "20"))
+BACKTEST_HORIZON = int(os.getenv("LSTM_BACKTEST_HORIZON", "365"))
 
 # ======================================================
 # Transformation Helper Functions
 # ======================================================
+def is_rainfall_param(param_name):
+    return param_name in RAINFALL_PARAMS or any(
+        x in param_name.lower() for x in ['rr', 'rain', 'precip', 'hujan']
+    )
+
+def is_continuous_weather_param(param_name):
+    return (
+        param_name in TEMP_PARAMS
+        or param_name in HUMIDITY_PARAMS
+        or param_name in SOLAR_PARAMS
+    )
+
+def prepare_cleaned_series(df, target_column):
+    """
+    Prepare a continuous daily series for LSTM without re-running full
+    preprocessing. Cleaned collections are treated as source of truth; this
+    only fills missing calendar rows needed by sequence models.
+    """
+    if target_column not in df.columns:
+        raise ValueError(f"Column '{target_column}' not found")
+
+    df = df.copy()
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.set_index('Date').sort_index()
+    df = df[~df.index.duplicated(keep='first')]
+
+    series = pd.to_numeric(df[target_column], errors='coerce')
+    date_range = pd.date_range(start=series.index[0], end=series.index[-1], freq='D')
+    missing_dates = date_range.difference(series.index)
+    print(f"   Missing dates after cleaned input: {len(missing_dates)}")
+
+    series = series.reindex(date_range)
+
+    if is_rainfall_param(target_column):
+        series = series.fillna(0)
+    elif is_continuous_weather_param(target_column):
+        series = series.interpolate(method='time', limit_direction='both')
+    else:
+        series = series.dropna()
+
+    return series.dropna()
+
 def apply_transformation(data, param_name):
     """Apply Log1p transformation for rainfall data specifically."""
-    is_rainfall = param_name in RAINFALL_PARAMS or any(x in param_name.lower() for x in ['rr', 'rain', 'precip'])
-    
-    if is_rainfall:
+    if is_rainfall_param(param_name):
         print(f"   ⚡ Applying Log1p Transformation for {param_name}")
         return np.log1p(data), "log1p"
     
@@ -73,7 +120,7 @@ def apply_seasonal_decomposition(series, period=365):
     """
     if len(series) < (period * 2):
         print("   ⚠️ Data too short for seasonal decomposition. Skipping.")
-        return series, None
+        return series, None, None
 
     print(f"   🍂 Applying Seasonal Decomposition (period={period})...")
     # Menggunakan model 'additive'
@@ -86,7 +133,41 @@ def apply_seasonal_decomposition(series, period=365):
     # Fill NaN just in case
     deseasonalized = deseasonalized.ffill().bfill()
     
-    return deseasonalized, seasonal
+    return deseasonalized, seasonal, decomposition
+
+def save_lstm_decomposition(db, decomposition, collection_name, target_column, config_id):
+    """Persist STL decomposition into temp collection for run_lstm aggregation."""
+    if decomposition is None:
+        return 0
+
+    saved_count = 0
+    for idx in decomposition.observed.index:
+        date_str = pd.Timestamp(idx).strftime("%Y-%m-%d")
+        param_doc = {
+            "observed": float(decomposition.observed.loc[idx]) if pd.notna(decomposition.observed.loc[idx]) else None,
+            "trend": float(decomposition.trend.loc[idx]) if pd.notna(decomposition.trend.loc[idx]) else None,
+            "seasonal": float(decomposition.seasonal.loc[idx]) if pd.notna(decomposition.seasonal.loc[idx]) else None,
+            "resid": float(decomposition.resid.loc[idx]) if pd.notna(decomposition.resid.loc[idx]) else None,
+            "source_collection": collection_name,
+            "scale": "transformed"
+        }
+
+        result = db["decompose-lstm-temp"].update_one(
+            {"date": date_str, "config_id": config_id},
+            {
+                "$set": {
+                    "date": date_str,
+                    "timestamp": datetime.now().isoformat(),
+                    "config_id": config_id,
+                    f"parameters.{target_column}": param_doc
+                }
+            },
+            upsert=True
+        )
+        if result.upserted_id or result.modified_count > 0:
+            saved_count += 1
+
+    return saved_count
 
 # ======================================================
 # PyTorch Dataset Class
@@ -194,7 +275,7 @@ def post_process_forecast(forecast, param_name, historical_data=None):
     elif param_name in NDVI_PARAMS:
         forecast = np.clip(forecast, -1, 1)
     elif param_name in TEMP_PARAMS:
-        forecast = np.clip(forecast, 10, 50)
+        forecast = np.clip(forecast, -50, 60)
     elif param_name in SOLAR_PARAMS:
         forecast = np.clip(forecast, 0, 30)
     else:
@@ -348,7 +429,15 @@ def calculate_metrics(y_true, y_pred, param_name="generic"):
 # ======================================================
 # Grid search
 # ======================================================
-def grid_search_pytorch(train_data, param_name, transform_method="none"):
+def restore_physical_scale(values, index, transform_method, seasonal_component=None):
+    values = np.asarray(values, dtype=float)
+    if seasonal_component is not None:
+        seasonal_values = seasonal_component.reindex(index).ffill().bfill().values
+        values = values + seasonal_values
+    return inverse_transformation(values, transform_method)
+
+def grid_search_pytorch(train_data, param_name, transform_method="none",
+                        original_data=None, seasonal_component=None):
     """Grid search with transformation support"""
     print(f"\n{'='*70}\nPYTORCH GRID SEARCH: {param_name} (Recursive + STL)\n{'='*70}")
     
@@ -372,6 +461,10 @@ def grid_search_pytorch(train_data, param_name, transform_method="none"):
         lookback_range = [60, 90, 180]
     
     scaler_range = ['standard', 'minmax']
+    if FAST_MODE:
+        lookback_range = lookback_range[:2]
+        scaler_range = ['standard']
+
     valid_lookbacks = [lb for lb in lookback_range if len(train_split) > lb + 100]
     
     if not valid_lookbacks:
@@ -424,7 +517,14 @@ def grid_search_pytorch(train_data, param_name, transform_method="none"):
             
             model = RecursiveLSTM(input_size=1, hidden_size_1=128, hidden_size_2=64, dropout=0.3).to(device)
             
-            model, _, _ = train_pytorch_model(model, train_loader, val_loader, epochs=50, lr=0.001, patience=15)
+            model, _, _ = train_pytorch_model(
+                model,
+                train_loader,
+                val_loader,
+                epochs=GRID_EPOCHS,
+                lr=0.001,
+                patience=GRID_PATIENCE
+            )
             
             # Predict
             model.eval()
@@ -443,12 +543,65 @@ def grid_search_pytorch(train_data, param_name, transform_method="none"):
             val_pred_unscaled = scaler.inverse_transform(val_pred.reshape(-1, 1)).flatten()
             val_true_unscaled = scaler.inverse_transform(val_true.reshape(-1, 1)).flatten()
             
-            metrics = calculate_metrics(val_true_unscaled, val_pred_unscaled, param_name)
+            val_metric_index = val_split.index[lookback:lookback + len(val_pred_unscaled)]
+            if original_data is not None:
+                y_true_physical = original_data.reindex(val_metric_index).values
+            else:
+                y_true_physical = restore_physical_scale(
+                    val_true_unscaled,
+                    val_metric_index,
+                    transform_method,
+                    seasonal_component
+                )
+            y_pred_physical = restore_physical_scale(
+                val_pred_unscaled,
+                val_metric_index,
+                transform_method,
+                seasonal_component
+            )
+            y_pred_physical = post_process_forecast(y_pred_physical, param_name)
+
+            metrics = calculate_metrics(y_true_physical, y_pred_physical, param_name)
+
+            recursive_horizon = min(BACKTEST_HORIZON, len(val_split))
+            recursive_metrics = None
+            if recursive_horizon > 0 and len(train_scaled) >= lookback:
+                recursive_pred = recursive_forecast(
+                    model=model,
+                    initial_window=train_scaled[-lookback:],
+                    forecast_horizon=recursive_horizon,
+                    scaler=scaler,
+                    device=device
+                )
+                recursive_index = val_split.index[:recursive_horizon]
+                recursive_pred_physical = restore_physical_scale(
+                    recursive_pred,
+                    recursive_index,
+                    transform_method,
+                    seasonal_component
+                )
+                recursive_pred_physical = post_process_forecast(recursive_pred_physical, param_name)
+                if original_data is not None:
+                    recursive_true = original_data.reindex(recursive_index).values
+                else:
+                    recursive_true = restore_physical_scale(
+                        val_split.iloc[:recursive_horizon].values,
+                        recursive_index,
+                        transform_method,
+                        seasonal_component
+                    )
+                recursive_metrics = calculate_metrics(recursive_true, recursive_pred_physical, param_name)
+                metrics["recursive_rmse"] = recursive_metrics["rmse"]
+                metrics["recursive_mae"] = recursive_metrics["mae"]
+                metrics["recursive_mape"] = recursive_metrics["mape"]
             
-            print(f"   RMSE (Deseasonalized): {metrics['rmse']:.3f}, R²: {metrics['r2']:.3f}")
+            print(f"   RMSE (physical one-step): {metrics['rmse']:.3f}, R²: {metrics['r2']:.3f}")
+            if recursive_metrics:
+                print(f"   Recursive RMSE ({recursive_horizon}d): {recursive_metrics['rmse']:.3f}")
             
-            if metrics['rmse'] < best_score:
-                best_score = metrics['rmse']
+            score = metrics.get("recursive_rmse", metrics["rmse"])
+            if score < best_score:
+                best_score = score
                 best_result = {
                     'lookback': lookback,
                     'scaler_type': scaler_type,
@@ -480,7 +633,7 @@ def grid_search_pytorch(train_data, param_name, transform_method="none"):
     print(f"{'='*70}")
     print(f"   Best lookback: {best_result['lookback']} days ({best_result['lookback']/365:.2f} years)")
     print(f"   Best scaler: {best_result['scaler_type']}")
-    print(f"   Best RMSE: {best_score:.4f}")
+    print(f"   Best selection score: {best_score:.4f}")
     print(f"{'='*70}\n")
     
     best_params = {
@@ -490,7 +643,7 @@ def grid_search_pytorch(train_data, param_name, transform_method="none"):
         'hidden_size_1': 128,
         'hidden_size_2': 64,
         'dropout': 0.3,
-        'epochs': 100,
+        'epochs': FINAL_EPOCHS,
         'batch_size': 128,
         'learning_rate': 0.001
     }
@@ -509,6 +662,7 @@ def run_lstm_analysis(collection_name, target_column, save_collection="lstm-fore
     print(f"{'='*70}")
     print(f"📊 Target: {collection_name}.{target_column}")
     print(f"🎯 Forecast horizon: {forecast_horizon} days (RECURSIVE)")
+    print(f"⚙️ Fast mode: {'ON' if FAST_MODE else 'OFF'}")
     print(f"⏰ Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}\n")
     
@@ -537,21 +691,7 @@ def run_lstm_analysis(collection_name, target_column, save_collection="lstm-fore
         print("\n🔧 Step 2: Data preparation...")
         df = pd.DataFrame(source_data)
         
-        if target_column not in df.columns:
-            raise ValueError(f"Column '{target_column}' not found")
-        
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.set_index('Date').sort_index()
-        
-        if not df.index.is_monotonic_increasing:
-            df = df.sort_index()
-
-        if '_id' in df.columns:
-            df = df.drop(columns=['_id'])
-            
-        df_resampled = df.resample('D').mean(numeric_only=True)
-        param_data = pd.to_numeric(df_resampled[target_column], errors='coerce')
-        param_data = param_data.interpolate(method='linear').ffill().bfill()
+        param_data = prepare_cleaned_series(df, target_column)
         
         if len(param_data) < 500:
             raise ValueError(f"Insufficient data: {len(param_data)}")
@@ -572,14 +712,29 @@ def run_lstm_analysis(collection_name, target_column, save_collection="lstm-fore
         
         # 4. [NEW] Apply Seasonal Decomposition
         print("\n🍂 Step 4: Seasonal Decomposition...")
-        deseasonalized_data, seasonal_component = apply_seasonal_decomposition(transformed_data)
+        deseasonalized_data, seasonal_component, decomposition = apply_seasonal_decomposition(transformed_data)
+        decompose_count = save_lstm_decomposition(
+            db=db,
+            decomposition=decomposition,
+            collection_name=collection_name,
+            target_column=target_column,
+            config_id=config_id
+        )
+        if decompose_count:
+            print(f"   ✅ Saved {decompose_count} decomposition points to decompose-lstm-temp")
         
         # Use deseasonalized data for training
         training_data = deseasonalized_data
         
         # 5. Grid search
         print("\n🔍 Step 5: Grid search (on Deseasonalized Data)...")
-        best_params, val_metrics = grid_search_pytorch(training_data, target_column, transform_method)
+        best_params, val_metrics = grid_search_pytorch(
+            training_data,
+            target_column,
+            transform_method,
+            original_data=param_data,
+            seasonal_component=seasonal_component
+        )
         
         if best_params is None:
             raise ValueError("No valid model found")
@@ -625,7 +780,7 @@ def run_lstm_analysis(collection_name, target_column, save_collection="lstm-fore
             final_model, train_loader, test_loader,
             epochs=best_params['epochs'],
             lr=best_params['learning_rate'],
-            patience=20
+            patience=FINAL_PATIENCE
         )
         
         # 7. Generate RECURSIVE forecast (Deseasonalized)
@@ -701,7 +856,12 @@ def run_lstm_analysis(collection_name, target_column, save_collection="lstm-fore
                             "transform": transform_method,
                             "forecast_method": "recursive_stl",
                             "lookback_days": best_params['lookback'],
-                            "test_rmse": val_metrics['rmse'] # Note: This is on deseasonalized data
+                            "test_rmse": val_metrics['rmse'],
+                            "test_mae": val_metrics['mae'],
+                            "test_mape": val_metrics['mape'],
+                            "recursive_rmse": val_metrics.get('recursive_rmse'),
+                            "recursive_mae": val_metrics.get('recursive_mae'),
+                            "recursive_mape": val_metrics.get('recursive_mape')
                         }
                     }
                 }
@@ -715,9 +875,19 @@ def run_lstm_analysis(collection_name, target_column, save_collection="lstm-fore
         # Upsert
         upsert_count = 0
         for doc in forecast_docs:
+            set_fields = {
+                f"parameters.{target_column}": doc["parameters"][target_column],
+                "timestamp": doc["timestamp"],
+                "source_collection": doc["source_collection"],
+                "config_id": doc["config_id"],
+            }
+
+            if append_column_id and "column_id" in doc:
+                set_fields["column_id"] = doc["column_id"]
+
             result = db[save_collection].update_one(
                 {"forecast_date": doc["forecast_date"], "config_id": config_id},
-                {"$set": doc},
+                {"$set": set_fields},
                 upsert=True
             )
             if result.upserted_id or result.modified_count > 0:
