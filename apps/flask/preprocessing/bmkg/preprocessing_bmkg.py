@@ -686,6 +686,7 @@ class BmkgPreprocessor:
             "imputation_validation": {},
             "model_coverage": {},
             "quality_metrics": {},
+            "rr_distribution_check": {},
             "warnings": []
         }
     
@@ -1248,38 +1249,56 @@ class BmkgPreprocessor:
         
         logger.info(f"    Detected {len(gaps)} gaps: {small_gaps} small, "
                    f"{medium_gaps} medium, {large_gaps} large")
+
     def _handle_outliers(
         self,
         df: pd.DataFrame,
-    )-> pd.DataFrame:
+    ) -> pd.DataFrame:
         """
         Detect and handle outliers using IQR and Z-score methods
-        
+
         Strategy:
         - IQR method: Q1 - k*IQR, Q3 + k*IQR (k=2.0 default)
         - Z-score method: |z| > threshold (3.5 default)
         - Treatment: Set to NaN for later imputation
+        - RR exception: rainfall is zero-inflated and right-skewed, so
+          IQR/Z-score values are logged for diagnostics only. RR outliers are
+          handled only by physical range checks.
         """
-        
+
         outlier_stats = {}
         methods = self.options.get("outlier_methods", ["iqr", "zscore"])
-        
+
+        # ==========================
+        # DIAGNOSTIC (BEFORE)
+        # ==========================
+        if 'RR' in df.columns:
+            logger.info(
+                f"[DIAG][RR] Before outlier handling: "
+                f"zero%={(df['RR'] == 0).mean() * 100:.1f}%, "
+                f"Q1={df['RR'].quantile(0.25)}, "
+                f"Q3={df['RR'].quantile(0.75)}, "
+                f"RR>0 count={(df['RR'] > 0).sum()}"
+            )
+
         for param in self.params_to_process:
             if param not in df.columns:
                 continue
-        
+
             # Skip non-numeric parameters
             if param == 'DDD_CAR':
                 continue
-            
+
             # Get valid range for this parameter
             if param not in self.valid_ranges:
                 continue
-            
+
             min_val, max_val = self.valid_ranges[param]
             outliers_detected = 0
             outlier_mask = pd.Series(False, index=df.index)
-            
+            statistical_mask = pd.Series(False, index=df.index)
+            use_statistical_outliers = param != "RR"
+
             # Suspicious zero detection: FF_AVG=0 tapi FF_X>0
             if param == 'FF_AVG' and 'FF_X' in df.columns:
                 suspicious_zero_mask = (
@@ -1288,64 +1307,120 @@ class BmkgPreprocessor:
                     df['FF_AVG'].notna()
                 )
                 outlier_mask |= suspicious_zero_mask
-                logger.info(f"    Detected {suspicious_zero_mask.sum()} suspicious FF_AVG zeros (FF_X>0 but FF_AVG=0)")
-            
+                logger.info(
+                    f"    Detected {suspicious_zero_mask.sum()} suspicious FF_AVG zeros "
+                    f"(FF_X>0 but FF_AVG=0)"
+                )
+
             # Method 1: IQR
             if "iqr" in methods:
                 Q1 = df[param].quantile(0.25)
                 Q3 = df[param].quantile(0.75)
                 IQR = Q3 - Q1
-                
+
                 k = self.options.get("iqr_multiplier", 2.5)
                 lower_bound = Q1 - k * IQR
                 upper_bound = Q3 + k * IQR
-                
+
                 iqr_outliers = (df[param] < lower_bound) | (df[param] > upper_bound)
-                outlier_mask |= iqr_outliers
-            
+                statistical_mask |= iqr_outliers
+                if use_statistical_outliers:
+                    outlier_mask |= iqr_outliers
+
+                # ==========================
+                # DIAGNOSTIC RR (IQR)
+                # ==========================
+                if param == "RR":
+                    logger.info(
+                        f"[DIAG][RR][IQR] "
+                        f"Q1={Q1:.3f}, Q3={Q3:.3f}, IQR={IQR:.3f}, "
+                        f"lower={lower_bound:.3f}, upper={upper_bound:.3f}, "
+                        f"IQR outliers={iqr_outliers.sum()}"
+                    )
+
             # Method 2: Z-score
             if "zscore" in methods:
                 threshold = self.options.get("zscore_threshold", 3.5)
                 mean = df[param].mean()
                 std = df[param].std()
-                
+
                 if std > 0:
                     z_scores = np.abs((df[param] - mean) / std)
                     zscore_outliers = z_scores > threshold
-                    outlier_mask |= zscore_outliers
-            
+                    statistical_mask |= zscore_outliers
+                    if use_statistical_outliers:
+                        outlier_mask |= zscore_outliers
+
+                    # ==========================
+                    # DIAGNOSTIC RR (ZSCORE)
+                    # ==========================
+                    if param == "RR":
+                        logger.info(
+                            f"[DIAG][RR][ZScore] "
+                            f"mean={mean:.3f}, std={std:.3f}, "
+                            f"threshold={threshold}, "
+                            f"Z-score outliers={zscore_outliers.sum()}"
+                        )
+
             # Method 3: Physical range (always applied)
             range_outliers = (df[param] < min_val) | (df[param] > max_val)
             outlier_mask |= range_outliers
-            
-            # Count outliers 
+
+            if param == "RR":
+                logger.info(
+                    f"[DIAG][RR] Statistical outliers ignored={statistical_mask.sum()}, "
+                    f"physical range outliers={range_outliers.sum()}, "
+                    f"total applied outlier mask={outlier_mask.sum()}"
+                )
+
+            # Count outliers
             outliers_detected = outlier_mask.sum()
-            
+
             if outliers_detected > 0:
-                # Apply treatment
                 treatment = self.options.get("outlier_treatment", "interpolate")
-                
+
                 if treatment == "interpolate":
                     df.loc[outlier_mask, param] = np.nan
-                    
+
                 elif treatment == "cap":
                     df.loc[df[param] < min_val, param] = min_val
                     df.loc[df[param] > max_val, param] = max_val
-                    
+
+                if param == "RR":
+                    logger.info(
+                        f"[DIAG][RR] After applying mask: "
+                        f"RR>0 count={(df['RR'] > 0).sum()}, "
+                        f"NaN count={df['RR'].isna().sum()}"
+                    )
+
                 outlier_stats[param] = {
                     "count": int(outliers_detected),
                     "percentage": round((outliers_detected / len(df)) * 100, 2),
                     "treatment": treatment
                 }
-        
+
         self.preprocessing_report["outliers"] = outlier_stats
-            
+
         if outlier_stats:
             total_outliers = sum(v["count"] for v in outlier_stats.values())
-            logger.info(f"    Detected and handled {total_outliers} outliers across {len(outlier_stats)} parameters")
+            logger.info(
+                f"    Detected and handled {total_outliers} outliers across "
+                f"{len(outlier_stats)} parameters"
+            )
         else:
             logger.info("    No outliers detected")
-        
+
+        # ==========================
+        # DIAGNOSTIC (AFTER)
+        # ==========================
+        if 'RR' in df.columns:
+            logger.info(
+                f"[DIAG][RR] Final state: "
+                f"RR>0 count={(df['RR'] > 0).sum()}, "
+                f"zero%={(df['RR'] == 0).mean() * 100:.1f}%, "
+                f"NaN={df['RR'].isna().sum()}"
+            )
+
         return df
     
     def _impute_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1502,6 +1577,7 @@ class BmkgPreprocessor:
                 
         # Final validation and cleanup
         df = self._finalize_rainfall_imputation(df)
+        self._log_rr_distribution_check(df)
         final_missing = df['RR'].isna().sum()
         imputed_count = original_missing_count - final_missing
         
@@ -1512,6 +1588,52 @@ class BmkgPreprocessor:
         logger.info(f"  Still missing: {final_missing}")
         logger.info(f"  Success rate: {((imputed_count / original_missing_count) * 100) if original_missing_count > 0 else 0:.1f}%")
         return df
+
+    def _log_rr_distribution_check(self, df: pd.DataFrame) -> None:
+        """Log RR distribution before vs after imputation to guard the rainfall tail."""
+        if 'RR' not in df.columns:
+            return
+
+        original_rr = None
+        if self.original_data is not None and 'RR' in self.original_data.columns:
+            original_rr = pd.to_numeric(self.original_data['RR'], errors='coerce').dropna()
+
+        processed_rr = pd.to_numeric(df['RR'], errors='coerce').dropna()
+
+        def snapshot(series: pd.Series) -> Dict[str, Optional[float]]:
+            if series is None or series.empty:
+                return {}
+
+            return {
+                "p50": round(float(series.quantile(0.50)), 3),
+                "p90": round(float(series.quantile(0.90)), 3),
+                "p95": round(float(series.quantile(0.95)), 3),
+                "p99": round(float(series.quantile(0.99)), 3),
+                "max": round(float(series.max()), 3),
+                "positive_count": int((series > 0).sum()),
+                "zero_pct": round(float((series == 0).mean() * 100), 2),
+            }
+
+        original_snapshot = snapshot(original_rr)
+        processed_snapshot = snapshot(processed_rr)
+
+        self.preprocessing_report["rr_distribution_check"] = {
+            "original": original_snapshot,
+            "processed": processed_snapshot,
+        }
+
+        if original_snapshot and processed_snapshot:
+            logger.info(
+                "[DIAG][RR][Distribution] "
+                f"original P50/P90/P95/P99/max="
+                f"{original_snapshot['p50']}/{original_snapshot['p90']}/"
+                f"{original_snapshot['p95']}/{original_snapshot['p99']}/"
+                f"{original_snapshot['max']} | "
+                f"processed P50/P90/P95/P99/max="
+                f"{processed_snapshot['p50']}/{processed_snapshot['p90']}/"
+                f"{processed_snapshot['p95']}/{processed_snapshot['p99']}/"
+                f"{processed_snapshot['max']}"
+            )
     
     def _classify_rain_occurrence(
         self,
@@ -2017,7 +2139,9 @@ class BmkgPreprocessor:
             # Apply maximum constraint
             amount = min(amount, max_daily)
             
-            # Agricultural categories (ensure realistic amounts)
+            # Agricultural categories are retained for reporting thresholds, but
+            # RR should not be hard-capped to "moderate" just because a heavy
+            # tropical rain event is isolated.
             categories = self.rain_classification_config['amount_categories']
             
             if amount <= categories['light']['max']:
@@ -2026,11 +2150,6 @@ class BmkgPreprocessor:
             elif amount <= categories['moderate']['max']:
                 # Moderate amounts are good for agriculture
                 pass  # No additional constraint
-            else:
-                # Heavy amounts: cap based on neighbor context
-                if neighbor_context.get('neighbor_count', 0) < 2:
-                    # Isolated heavy rain: reduce to moderate
-                    amount = min(amount, categories['moderate']['max'])
             
             return round(amount, 1)  # Round to 0.1mm precision
         except Exception as e:
@@ -2065,10 +2184,19 @@ class BmkgPreprocessor:
                 remaining_missing = df['RR'].isna().sum()
                 logger.warning(f"{remaining_missing} values still missing after two-stage imputation")
                 
-                long_gap_mask = df.get("_RR_long_gap", False)
-                # Only fill NON-long-gap remaining NaN (gap-aware)
+                long_gap_mask = (
+                    df["_RR_long_gap"].fillna(False)
+                    if "_RR_long_gap" in df.columns
+                    else pd.Series(False, index=df.index)
+                )
+                long_gap_remaining = int((df['RR'].isna() & long_gap_mask).sum())
+                if long_gap_remaining > 0:
+                    logger.info(
+                        f"Filling {long_gap_remaining} RR long-gap values with monthly climatology"
+                    )
+
                 for month in range(1, 13):
-                    month_mask = (df.index.month == month) & df['RR'].isna() & (long_gap_mask == False)
+                    month_mask = (df.index.month == month) & df['RR'].isna()
                     if month_mask.sum() > 0:
                         monthly_median = df[
                             (df.index.month == month) & 
@@ -4661,6 +4789,7 @@ class BmkgPreprocessor:
                 
                 # Quality Metrics (keep full)
                 "quality_metrics": self.preprocessing_report.get("quality_metrics", {}),
+                "rr_distribution_check": self.preprocessing_report.get("rr_distribution_check", {}),
                 
                 # INLINE imputation validation simplification
                 "imputation_validation": {
