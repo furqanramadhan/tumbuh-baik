@@ -21,7 +21,7 @@ import tempfile
 import shutil
 from queue import Queue
 import threading
-from multiprocessing import Process
+import multiprocessing as mp
 import time
 from typing import Dict, Any
 from preprocessing.buoys.preprocessing_buoys import (
@@ -108,7 +108,9 @@ def run_lstm():
         return jsonify({"message": "No pending LSTM config found."}), 404
 
     config_id = str(pending_config["_id"])
-    process = Process(
+    start_method = os.getenv("LSTM_MP_START_METHOD", "spawn")
+    process_ctx = mp.get_context(start_method)
+    process = process_ctx.Process(
         target=run_lstm_background_worker,
         args=(config_id, mongo_uri, db_name)
     )
