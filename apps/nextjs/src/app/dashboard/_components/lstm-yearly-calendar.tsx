@@ -63,32 +63,37 @@ const getSuitability = (
   radiation: number,
 ) => {
   const criteria = {
-    isRainSesuai: rain >= 5.7 && rain <= 16.7, // Syarat Mutlak Tanam
+    isRainSesuai: rain >= 5.7 && rain <= 16.7,
+    isRainTooLow: rain < 5.7,
+    isRainTooHigh: rain > 16.7,
     isTempSesuai: temp >= 24 && temp <= 29,
     isHumiditySesuai: humidity >= 33 && humidity <= 90,
     isRadiationSesuai: radiation >= 15 && radiation <= 25,
+    isRadiationTooLow: radiation < 15,
+    isRadiationTooHigh: radiation > 25,
   };
 
-  // 1. SYARAT MUTLAK: HUJAN
-  // Jika hujan kurang/banjir, langsung tidak cocok (Bera), tidak peduli parameter lain bagus.
-  if (!criteria.isRainSesuai) {
-    return { type: "tidakCocok" as const };
-  }
+  const isSuitable =
+    criteria.isRainSesuai &&
+    criteria.isTempSesuai &&
+    criteria.isHumiditySesuai &&
+    criteria.isRadiationSesuai;
 
-  // 2. HITUNG SKOR (Hujan sudah pasti sesuai di sini)
-  const sesuaiCount = Object.values(criteria).filter(Boolean).length;
-
-  // Skor 4/4: Sempurna
-  if (sesuaiCount === 4) {
+  if (isSuitable) {
     return { type: "sangatCocok" as const };
   }
 
-  // Skor 3/4: Masih cocok tanam
-  if (sesuaiCount === 3) {
+  const isPlantableWithWarning =
+    !criteria.isRainTooLow &&
+    criteria.isTempSesuai &&
+    criteria.isHumiditySesuai &&
+    !criteria.isRadiationTooLow &&
+    (criteria.isRainTooHigh || criteria.isRadiationTooHigh);
+
+  if (isPlantableWithWarning) {
     return { type: "cukupCocok" as const };
   }
 
-  // Skor < 3: Tidak cocok (parameter pendukung buruk)
   return { type: "tidakCocok" as const };
 };
 
@@ -476,7 +481,7 @@ export function LSTMYearlyCalendar() {
                             monthData.totalCukupCocok}{" "}
                           dari {monthData.daysInMonth} hari
                         </div>
-                        <div className="text-xs mt-0.5">kondisi baik</div>
+                        <div className="text-xs mt-0.5">dapat tanam</div>
                       </div>
                     </div>
                   </div>
@@ -505,15 +510,15 @@ export function LSTMYearlyCalendar() {
             <div className="flex flex-wrap items-center justify-center gap-4 mt-4 pt-3 border-t text-xs text-muted-foreground">
               <div className="flex items-center gap-1.5">
                 <div className="w-4 h-4 rounded-sm bg-green-400"></div>
-                <span>Sangat Cocok (4/4)</span>
+                <span>Sesuai</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <div className="w-4 h-4 rounded-sm bg-yellow-300"></div>
-                <span>Cukup Cocok (3/4)</span>
+                <span>Waspada, masih dapat tanam</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <div className="w-4 h-4 rounded-sm bg-red-400"></div>
-                <span>Tidak Cocok (&lt;3)</span>
+                <span>Tidak sesuai</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <div className="w-4 h-4 rounded-sm bg-gray-100 border"></div>

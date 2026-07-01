@@ -109,24 +109,75 @@ def inverse_transformation(data, method):
         return np.maximum(0, np.expm1(data))
     return data
 
-def estimate_log_bias_correction(actual_physical, predicted_transformed, transform_method):
+def estimate_log_bias_correction(
+    actual_physical,
+    predicted_transformed,
+    transform_method,
+    param_name=None,
+    wet_day_threshold=1.0
+):
     """
     Estimate median residual correction in transformed log space.
     Median correction is intentionally used instead of Duan smearing so rainfall
     zeros and extremes do not create unstable exp residuals.
     """
-    if transform_method != "log1p":
-        return 0.0
+    default_result = {
+        "correction": 0.0,
+        "raw_correction": 0.0,
+        "mode": "none",
+        "sample_count": 0,
+        "wet_day_threshold": None,
+        "negative_clamped": False,
+        "positive_capped": False
+    }
 
+    if transform_method != "log1p":
+        return default_result
+
+    actual_physical = np.asarray(actual_physical, dtype=float)
     actual_log = np.log1p(np.asarray(actual_physical, dtype=float))
     predicted_log = np.asarray(predicted_transformed, dtype=float)
     mask = np.isfinite(actual_log) & np.isfinite(predicted_log)
     if not mask.any():
-        return 0.0
+        return default_result
 
-    residuals = np.clip(actual_log[mask] - predicted_log[mask], -5, 5)
-    correction = float(np.median(residuals))
-    return correction if np.isfinite(correction) else 0.0
+    correction_mask = mask
+    mode = "median_all_days"
+    if param_name and is_rainfall_param(param_name):
+        wet_mask = mask & (actual_physical >= wet_day_threshold)
+        if wet_mask.sum() >= 10:
+            correction_mask = wet_mask
+            mode = "median_wet_days"
+        else:
+            mode = "median_all_days_insufficient_wet_days"
+
+    residuals = np.clip(actual_log[correction_mask] - predicted_log[correction_mask], -5, 5)
+    if len(residuals) == 0:
+        return default_result
+
+    raw_correction = float(np.median(residuals))
+    correction = raw_correction if np.isfinite(raw_correction) else 0.0
+    negative_clamped = False
+    positive_capped = False
+
+    if param_name and is_rainfall_param(param_name):
+        # Do not let dry-day dominance push rainfall forecasts lower for planting rules.
+        if correction < 0:
+            correction = 0.0
+            negative_clamped = True
+        if correction > 1.0:
+            correction = 1.0
+            positive_capped = True
+
+    return {
+        "correction": correction if np.isfinite(correction) else 0.0,
+        "raw_correction": raw_correction if np.isfinite(raw_correction) else 0.0,
+        "mode": mode,
+        "sample_count": int(correction_mask.sum()),
+        "wet_day_threshold": wet_day_threshold if param_name and is_rainfall_param(param_name) else None,
+        "negative_clamped": negative_clamped,
+        "positive_capped": positive_capped
+    }
 
 def apply_log_bias_correction(values, transform_method, bias_correction=0.0):
     values = np.asarray(values, dtype=float)
@@ -650,6 +701,15 @@ def grid_search_pytorch(train_data, param_name, transform_method="none",
                     seasonal_component
                 )
 
+            bias_info = {
+                "correction": 0.0,
+                "raw_correction": 0.0,
+                "mode": "none",
+                "sample_count": 0,
+                "wet_day_threshold": None,
+                "negative_clamped": False,
+                "positive_capped": False
+            }
             bias_correction = 0.0
             if is_rainfall_param(param_name) and transform_method == "log1p":
                 val_pred_transformed = restore_transformed_scale(
@@ -657,11 +717,13 @@ def grid_search_pytorch(train_data, param_name, transform_method="none",
                     val_metric_index,
                     seasonal_component
                 )
-                bias_correction = estimate_log_bias_correction(
+                bias_info = estimate_log_bias_correction(
                     y_true_physical,
                     val_pred_transformed,
-                    transform_method
+                    transform_method,
+                    param_name
                 )
+                bias_correction = bias_info["correction"]
 
             y_pred_physical = restore_physical_scale(
                 val_pred_unscaled,
@@ -674,6 +736,12 @@ def grid_search_pytorch(train_data, param_name, transform_method="none",
 
             metrics = calculate_metrics(y_true_physical, y_pred_physical, param_name)
             metrics["log_bias_correction"] = bias_correction
+            metrics["log_bias_correction_raw"] = bias_info["raw_correction"]
+            metrics["log_bias_correction_mode"] = bias_info["mode"]
+            metrics["log_bias_correction_sample_count"] = bias_info["sample_count"]
+            metrics["log_bias_correction_wet_day_threshold"] = bias_info["wet_day_threshold"]
+            metrics["log_bias_correction_negative_clamped"] = bias_info["negative_clamped"]
+            metrics["log_bias_correction_positive_capped"] = bias_info["positive_capped"]
 
             recursive_horizon = min(BACKTEST_HORIZON, len(val_split))
             recursive_metrics = None
@@ -759,7 +827,13 @@ def grid_search_pytorch(train_data, param_name, transform_method="none",
         'epochs': FINAL_EPOCHS,
         'batch_size': 128,
         'learning_rate': 0.001,
-        'log_bias_correction': best_result['metrics'].get('log_bias_correction', 0.0)
+        'log_bias_correction': best_result['metrics'].get('log_bias_correction', 0.0),
+        'log_bias_correction_raw': best_result['metrics'].get('log_bias_correction_raw', 0.0),
+        'log_bias_correction_mode': best_result['metrics'].get('log_bias_correction_mode', 'none'),
+        'log_bias_correction_sample_count': best_result['metrics'].get('log_bias_correction_sample_count', 0),
+        'log_bias_correction_wet_day_threshold': best_result['metrics'].get('log_bias_correction_wet_day_threshold'),
+        'log_bias_correction_negative_clamped': best_result['metrics'].get('log_bias_correction_negative_clamped', False),
+        'log_bias_correction_positive_capped': best_result['metrics'].get('log_bias_correction_positive_capped', False)
     }
     
     return best_params, best_result['metrics']
@@ -861,6 +935,14 @@ def run_lstm_analysis(collection_name, target_column, save_collection="lstm-fore
         
         if best_params is None:
             raise ValueError("No valid model found")
+
+        if is_rainfall_param(target_column) and best_params.get("log_bias_correction_negative_clamped"):
+            warning_msg = (
+                f"{target_column}: negative log bias correction was clamped to 0.0 "
+                "to avoid rainfall underestimation in planting-calendar thresholds."
+            )
+            print(f"   ⚠️ {warning_msg}")
+            warnings_list.append(warning_msg)
         
         # 6. Final training
         print("\n🎓 Step 6: Final model training...")
@@ -992,6 +1074,12 @@ def run_lstm_analysis(collection_name, target_column, save_collection="lstm-fore
                             "recursive_mae": val_metrics.get('recursive_mae'),
                             "recursive_mape": val_metrics.get('recursive_mape'),
                             "log_bias_correction": log_bias_correction,
+                            "log_bias_correction_raw": best_params.get("log_bias_correction_raw"),
+                            "log_bias_correction_mode": best_params.get("log_bias_correction_mode"),
+                            "log_bias_correction_sample_count": best_params.get("log_bias_correction_sample_count"),
+                            "log_bias_correction_wet_day_threshold": best_params.get("log_bias_correction_wet_day_threshold"),
+                            "log_bias_correction_negative_clamped": best_params.get("log_bias_correction_negative_clamped"),
+                            "log_bias_correction_positive_capped": best_params.get("log_bias_correction_positive_capped"),
                             "horizon_rmse_proxy": horizon_confidence["rmse_proxy"][i],
                             "horizon_confidence": horizon_confidence["confidence"][i],
                             "rmse_degradation_pct": horizon_confidence["summary"].get("rmse_degradation_pct"),
